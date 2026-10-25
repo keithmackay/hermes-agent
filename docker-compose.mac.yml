@@ -1,0 +1,47 @@
+#
+# docker-compose.mac.yml — Docker Desktop for Mac (Apple Silicon and Intel)
+#
+# Differences from docker-compose.yml:
+#   - No `network_mode: host`; explicit port mappings bound to 127.0.0.1 so
+#     nothing is reachable from other machines.
+#   - Named volume instead of a ~/.hermes bind mount. Docker Desktop shares
+#     host folders over virtiofs, where SQLite WAL mode can corrupt data;
+#     a named volume lives on the VM's own disk.
+#   - Single container: the dashboard runs under the gateway's s6 tree
+#     (HERMES_DASHBOARD=1) rather than as a second container.
+#   - Inside the container, services must bind 0.0.0.0 for port publishing to
+#     work, which makes Hermes require dashboard auth and an API key. Those
+#     come from .env.mac (git-ignored); copy .env.mac.example to create it.
+#
+# Usage:
+#   docker compose -f docker-compose.mac.yml run --rm hermes setup   # once
+#   docker compose -f docker-compose.mac.yml up -d
+#
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    # To run this fork's code instead of the published image, uncomment:
+    # build: .
+    container_name: hermes
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    ports:
+      - "127.0.0.1:8642:8642"   # OpenAI-compatible API
+      - "127.0.0.1:9119:9119"   # dashboard
+    volumes:
+      - hermes-data:/opt/data
+    env_file: .env.mac
+    environment:
+      - HERMES_DASHBOARD=1
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+    shm_size: 1g                # Chromium for browser tools
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+
+volumes:
+  hermes-data:
+    name: hermes-data
