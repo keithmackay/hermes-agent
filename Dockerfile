@@ -344,6 +344,24 @@ RUN cd plugins/platforms/photon/sidecar && \
     npm ci --no-audit --fetch-retries=5 && \
     npm cache clean --force
 
+# ---------- Claude Code CLI ----------
+# Lets the agent delegate coding work to `claude -p` (print mode) through the
+# bundled claude-code skill. Installed root-owned, so the hermes user cannot
+# self-update it: bump CLAUDE_CODE_VERSION and rebuild instead. Auth comes from
+# CLAUDE_CODE_OAUTH_TOKEN at runtime, which the terminal env policy passes
+# through to agent-spawned `claude` processes. Two npm guards must be satisfied
+# or the install fails with "native binary not installed": the pinned version
+# must be at least 14 days old (.npmrc min-release-age, which applies to the
+# platform-native optional dependency too), and the package's postinstall must
+# be explicitly allowed (npm blocks install scripts by default).
+ARG CLAUDE_CODE_VERSION=2.1.296
+RUN npm install -g --prefix /usr/local --no-audit --fetch-retries=5 \
+        --allow-scripts=@anthropic-ai/claude-code \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
+    npm cache clean --force && \
+    claude --version
+ENV DISABLE_AUTOUPDATER=1
+
 # Shared product outputs are independent of application dependency assembly.
 COPY --from=frontend_build /opt/products/tui /opt/hermes/ui-tui
 COPY --from=frontend_build /opt/products/web /opt/hermes/hermes_cli/web_dist

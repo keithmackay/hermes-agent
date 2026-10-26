@@ -12,16 +12,18 @@
 #   - Inside the container, services must bind 0.0.0.0 for port publishing to
 #     work, which makes Hermes require dashboard auth and an API key. Those
 #     come from .env.mac (git-ignored); copy .env.mac.example to create it.
+#   - Built from this checkout (includes the Claude Code CLI), not pulled.
+#     Set CLAUDE_CODE_OAUTH_TOKEN in .env.mac so the agent can run `claude -p`.
 #
 # Usage:
+#   docker compose -f docker-compose.mac.yml build
 #   docker compose -f docker-compose.mac.yml run --rm hermes setup   # once
 #   docker compose -f docker-compose.mac.yml up -d
 #
 services:
   hermes:
-    image: nousresearch/hermes-agent:latest
-    # To run this fork's code instead of the published image, uncomment:
-    # build: .
+    build: .
+    image: hermes-agent:mac-local
     container_name: hermes
     restart: unless-stopped
     command: ["gateway", "run"]
