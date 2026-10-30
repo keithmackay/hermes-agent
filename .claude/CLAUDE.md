@@ -10,3 +10,6 @@ This is a fork of NousResearch/hermes-agent. Upstream's contributor guide is `AG
   on the unmodified upstream image.
 - Never put secrets inside the repo tree: upstream's `COPY . .` would bake them into the image. They
   live in `~/.config/hermes-fork/env.mac`.
+- Testing `fork/sync/fork-sync.sh`: Docker image and container names are global, so a test clone can
+  rebuild and redeploy the live container. Test clones must never have a buildable compose file;
+  commit a deliberately broken `fork/docker-compose.mac.yml` in each clone first.

@@ -1,6 +1,6 @@
 # Plan: nightly upstream sync and rebuild
 
-**Status:** Phase 1 done (2026-10-30); Phases 2–5 not started
+**Status:** Phases 1–2 done (2026-10-30); Phases 3–5 not started
 **Date:** 2026-10-30
 **Change log:** record each phase in [`docs/specs/fork-changes.md`](../specs/fork-changes.md) as it lands.
 
@@ -156,7 +156,42 @@ Original steps, kept for reference:
 6. Commit as "Move fork-specific files into fork/; layer Claude Code on the upstream image" and log it
    in `docs/specs/fork-changes.md`.
 
-## Phase 2: host worker `fork/sync/fork-sync.sh`
+## Phase 2: host worker `fork/sync/fork-sync.sh`, DONE 2026-10-30
+
+**As built** (beyond the steps below):
+
+- **Version stamp** (resolves the Phase 1 follow-up): before building, the script runs upstream's own
+  `python3 -m scripts.releases.distance` and `scripts/write_install_stamp.py` (as CI does) to write the
+  git-ignored `install-stamp.json`, which the root Dockerfile's `COPY . .` picks up. It deletes the file
+  on exit so a later manual build can't bake in a stale stamp. No upstream files are edited.
+- **Ownership guard (new):** preflight refuses to run when the `hermes` container was created from a
+  different checkout's compose file (the `com.docker.compose.project.config_files` label) that still
+  exists. Docker image and container names are global, not per checkout. See the incident below.
+- **`mac-previous` is tagged before the build, as this plan specified.** The first version tagged it
+  afterwards, and that silently did nothing: Docker Desktop's containerd image store **deletes an image
+  the moment its last tag moves**, even while a container still runs from it. For the same reason, the
+  tidy step now only prunes build cache, because superseded images vanish with their tags.
+- **No-op detection** also requires `$STATE_DIR/deployed_sha` to match HEAD, so a run that pushed but
+  failed health is retried the next night instead of being treated as up to date.
+- **Rollback** keeps the rejected image as `hermes-agent:mac-failed` for inspection.
+- `skipped` results (dirty tree, wrong branch) raise a macOS notification, just like `failed`.
+- Test-only env overrides are listed in the script header.
+
+**Tests run** (throwaway clones with bare origin/upstream repos, every clone given an unbuildable
+compose file): no-trigger silent exit, dry run against the real repo (2,309 upstream commits merge
+cleanly; Claude Code would go 2.1.296 → 2.1.302), dirty tree, wrong branch, ownership guard, real merge
+conflict (aborted cleanly), build failure (local reset, nothing pushed, `mac-previous` correct), no-op,
+live and stale lock, trigger consumption, and the health check (passes on the running image; fails on
+a wrong image or a dead endpoint).
+
+**Incident during testing (2026-10-30 18:44):** the first test harness used clones whose compose
+file could still build. A "merge conflict" case picked a file upstream hadn't changed, so the merge
+succeeded and the script built and **redeployed the live `hermes` container** from the test clone
+(merged upstream plus Claude Code 2.1.302 plus a junk README commit). Pushes went only to the test's
+bare origin; GitHub and the real checkout were untouched. Because of the tag-ordering bug above, the
+previous image was lost, and the new code had already migrated Hermes config v51 → v52 in `hermes-data`.
+Fixes: the ownership guard, tagging before the build, and the test rule "clones must never have a
+buildable compose file", now in `.claude/CLAUDE.md`.
 
 Wrap the whole body in `main() { ... }; main "$@"`. Bash reads scripts as it runs them, and the merge
 can rewrite this very file mid-run. Support `--dry-run` and `--force-run` (ignore the missing trigger).
