@@ -1,0 +1,69 @@
+#
+# docker-compose.mac.yml: Docker Desktop for Mac (Apple Silicon and Intel)
+#
+# Differences from the upstream docker-compose.yml:
+#   - No `network_mode: host`. Port mappings are bound to 127.0.0.1 so
+#     nothing is reachable from other machines.
+#   - Named volume instead of a ~/.hermes bind mount. Docker Desktop shares
+#     host folders over virtiofs, where SQLite WAL mode can corrupt data;
+#     a named volume lives on the VM's own disk.
+#   - One container: the dashboard runs under the gateway's s6 tree
+#     (HERMES_DASHBOARD=1) rather than as a second container.
+#   - Inside the container, services must bind 0.0.0.0 for port publishing to
+#     work, which makes Hermes require dashboard auth and an API key. Those
+#     secrets live OUTSIDE the repo in ~/.config/hermes-fork/env.mac (copy
+#     env.mac.example there). Keep them outside the repo: the upstream build
+#     does `COPY . .`, and its .dockerignore only excludes root-level .env.*,
+#     so a secrets file anywhere else in the tree would be baked into the image.
+#   - Two-stage build: `hermes-base` is upstream's Dockerfile, unmodified, and
+#     `hermes` layers fork/Dockerfile (Claude Code CLI) on top of it.
+#
+# Usage (from the repo root):
+#   docker compose -f fork/docker-compose.mac.yml build
+#   docker compose -f fork/docker-compose.mac.yml run --rm hermes setup   # once
+#   docker compose -f fork/docker-compose.mac.yml up -d
+#
+name: hermes-agent   # keep the project name from when this file lived at the repo root
+
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        hermes-base: "service:hermes-base"
+    image: hermes-agent:mac-local
+    container_name: hermes
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    ports:
+      - "127.0.0.1:8642:8642"   # OpenAI-compatible API
+      - "127.0.0.1:9119:9119"   # dashboard
+    volumes:
+      - hermes-data:/opt/data
+    env_file: ${HOME}/.config/hermes-fork/env.mac
+    environment:
+      - HERMES_DASHBOARD=1
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - HERMES_TIMEZONE=America/New_York   # cron schedules; the container itself runs on UTC
+    shm_size: 1g                # Chromium for browser tools
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+
+  # Upstream image, built from the repo root exactly as upstream ships it.
+  # Only ever built (as hermes' base), never started: scale 0 keeps the service
+  # in the model, which `service:` contexts require (an inactive profile
+  # doesn't), without running a container.
+  hermes-base:
+    build:
+      context: ..
+    image: hermes-agent:upstream-local
+    scale: 0
+
+volumes:
+  hermes-data:
+    name: hermes-data

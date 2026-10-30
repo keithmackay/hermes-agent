@@ -1,6 +1,6 @@
 # Plan: nightly upstream sync and rebuild
 
-**Status:** proposed, not yet implemented
+**Status:** Phase 1 done (2026-10-30); Phases 2–5 not started
 **Date:** 2026-10-30
 **Change log:** record each phase in [`docs/specs/fork-changes.md`](../specs/fork-changes.md) as it lands.
 
@@ -52,8 +52,7 @@ fork-specific material into `fork/`, which upstream will never touch:
 fork/
   Dockerfile               # FROM the upstream-built image; adds Claude Code (CLAUDE_CODE_VERSION lives here)
   docker-compose.mac.yml   # moved from the repo root
-  .env.mac.example         # moved from the repo root
-  .gitignore               # ignores .env.mac
+  env.mac.example          # template; the real secrets live outside the repo (see Phase 1)
   hermes-scripts/          # the no-agent cron scripts, mounted read-only into the container
     fork-sync-trigger.sh
     fork-sync-report.sh
@@ -72,7 +71,39 @@ fork/
 - a failed build never reaches the fork: local `main` is reset to the commit it started from, and the old container keeps running
 - the image currently running is tagged `hermes-agent:mac-previous` before the build, so an unhealthy new container can be swapped back
 
-## Phase 1: move fork-only files into `fork/` (one-time)
+## Phase 1: move fork-only files into `fork/` (one-time), DONE 2026-10-30
+
+**How it was actually done** (it differs from the original steps below in four ways):
+
+- **Secrets live outside the repo, at `~/.config/hermes-fork/env.mac`** (mode 600), not in `fork/.env.mac`.
+  Upstream's `Dockerfile` does `COPY . .` and its `.dockerignore` only excludes `.env.*` at the repo root,
+  so a secrets file under `fork/` would have been baked into the base image. As a result, no `fork/.gitignore` is needed.
+- **`hermes-base` uses `scale: 0`, not an inactive profile.** Compose rejects a `service:` context that
+  points at a profiled-out service ("declares unknown service"). `scale: 0` keeps it buildable and never
+  starts it. Verified: `mac-local`'s layers are `upstream-local`'s 37 layers plus one.
+- **`Dockerfile` and `.gitignore` were restored from the branch point `e7719ae45d`, not `upstream/main`**,
+  so the move didn't also pull in 2,309 unmerged upstream commits' worth of changes.
+- **The trigger-folder and script mounts are deferred to Phase 4.** Docker would create their mount points
+  inside the `hermes-data` volume as root, which risks making `/opt/data/scripts` unwritable for the hermes
+  user. Add and verify them together with the scripts that use them.
+
+Also set: `name: hermes-agent` at the top of the compose file, so moving it into `fork/` didn't change
+the project name (that would have clashed with the existing `hermes` container). The upstream image ends
+as `root`, so `fork/Dockerfile` needs no `USER` lines.
+
+Verified after relaunch:
+- dashboard redirects to `/login`; API returns 401 without the key and 200 with it
+- `claude` 2.1.296 at `/usr/local/bin/claude`, and `claude -p` answered as the hermes user with the OAuth token
+- Hermes time is −04:00 (New York)
+- gateway running; existing data in `hermes-data` intact
+
+**Follow-up found:** images built from source report version `unknown` (the published image says
+`v0.22.5 · upstream <sha>`). Upstream CI stamps `install-stamp.json` (see
+`hermes_cli/version_info.py`, `scripts/write_install_stamp.py`), and local builds don't. This predates
+Phase 1. Have `fork-sync.sh` generate the stamp before building, if it can be done without editing
+upstream files.
+
+Original steps, kept for reference:
 
 1. `git mv docker-compose.mac.yml .env.mac.example fork/`, and move `.env.mac` (untracked) to `fork/.env.mac`.
 2. Revert the Claude Code block in the root `Dockerfile` and the `.env.mac` line in the root `.gitignore`
@@ -183,6 +214,11 @@ Optional safety net: on the `StartInterval` path, if no trigger has arrived in 3
 notification ("Hermes nightly sync hasn't been triggered: is the container running?").
 
 ## Phase 4: Hermes cron jobs
+
+First add the two mounts deferred from Phase 1 to `fork/docker-compose.mac.yml`
+(`~/.local/state/hermes-fork-sync:/opt/data/fork-sync` and
+`./hermes-scripts:/opt/data/scripts/fork:ro`). Then confirm that `/opt/data/scripts` is still writable
+by the hermes user and that the startup chown doesn't trip over the read-only mount.
 
 Scripts live in `fork/hermes-scripts/` and are mounted read-only at `/opt/data/scripts/fork/`. Hermes
 only runs scripts inside `$HERMES_HOME/scripts/`, and the read-only mount means the agent can't edit them.

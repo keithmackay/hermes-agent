@@ -6,13 +6,17 @@ logged here; `git log upstream/main..main` shows what's ours.
 
 **Conventions**
 - Fork-only files live in `fork/`. Don't edit upstream files unless there is no other way, and when you
-  must, record the file and reason here so merge conflicts are easy to diagnose. (Until plan Phase 1
-  lands, the files listed below still sit at the repo root.)
+  must, record the file and reason here so merge conflicts are easy to diagnose.
+- Secrets never go inside the repo tree (upstream's `COPY . .` would bake them into the image). They
+  live in `~/.config/hermes-fork/`.
 - Plans go in `docs/plans/`. This log and other specs go in `docs/specs/`.
+
+**Upstream files currently modified: none** (as of 2026-10-30, sync plan Phase 1).
 
 | Date | Commit | Change | Files | Upstream files touched |
 |---|---|---|---|---|
-| 2026-10-30 | (this commit) | Plan for nightly upstream sync and rebuild (Hermes cron triggers a macOS launchd worker). Started this change log and the fork conventions. | `docs/plans/2026-10-30-nightly-upstream-sync.md`, `docs/specs/fork-changes.md`, `.claude/CLAUDE.md` | none |
+| 2026-10-30 | (this commit) | Sync plan Phase 1: moved the fork's files into `fork/`. Claude Code moved to `fork/Dockerfile`, a one-layer image on top of the unmodified upstream image (`hermes-base`, built with `scale: 0`). Secrets moved out of the repo to `~/.config/hermes-fork/env.mac`. Added `HERMES_TIMEZONE=America/New_York`. Compose project name pinned to `hermes-agent`. Run with `docker compose -f fork/docker-compose.mac.yml ...`. | `fork/Dockerfile`, `fork/docker-compose.mac.yml`, `fork/env.mac.example` (moved from the root `.env.mac.example`), docs | Reverted both to upstream: `Dockerfile` (Claude Code block removed) and `.gitignore` (`.env.mac` line removed). |
+| 2026-10-30 | `f26efbf6ee` | Plan for nightly upstream sync and rebuild (Hermes cron triggers a macOS launchd worker). Started this change log and the fork conventions. | `docs/plans/2026-10-30-nightly-upstream-sync.md`, `docs/specs/fork-changes.md`, `.claude/CLAUDE.md` | none |
 | 2026-10-25 | `05aed45ad2` | Baked the Claude Code CLI (2.1.296, auto-update off) into the image so the bundled `claude-code` skill can run `claude -p` and interactive sessions. The Mac compose now builds from this checkout as `hermes-agent:mac-local`. `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) goes in `.env.mac`. | `Dockerfile`, `docker-compose.mac.yml`, `.env.mac.example` | `Dockerfile`: Claude Code block after the photon sidecar install. Phase 1 moves it into `fork/Dockerfile`. |
 | 2026-10-24 | `297866f933` | Docker Desktop for Mac setup: one container (gateway and dashboard), named volume `hermes-data` (avoids SQLite WAL corruption on virtiofs), ports bound to 127.0.0.1, dashboard basic auth and API key from the git-ignored `.env.mac`. | `docker-compose.mac.yml`, `.env.mac.example` | `.gitignore`: `+.env.mac`. Phase 1 moves it to `fork/.gitignore`. |
 
