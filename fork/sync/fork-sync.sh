@@ -222,7 +222,9 @@ preflight() {
   if [ -n "$owner" ] && [ "$owner" != "$COMPOSE_FILE" ] && [ -e "$owner" ] && [ "${FORK_SYNC_UNSAFE_ANY_CHECKOUT:-0}" != 1 ]; then
     fail preflight "the running container belongs to $owner, not this checkout ($COMPOSE_FILE)"; return 1
   fi
-  local url; url="$(git remote get-url upstream 2>/dev/null || true)"
+  # Compare the stored URL: `git remote get-url` applies url.*.insteadOf rewrites
+  # (e.g. a global https -> ssh rule), which would never match.
+  local url; url="$(git config --get remote.upstream.url || true)"
   if [ -z "$url" ]; then
     git remote add upstream "$UPSTREAM_URL" || { fail preflight "could not add upstream remote"; return 1; }
   elif [ "$url" != "$UPSTREAM_URL" ]; then
