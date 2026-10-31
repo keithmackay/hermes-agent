@@ -15,7 +15,8 @@
 #
 # Test overrides (env): FORK_SYNC_REPO, FORK_SYNC_STATE_DIR, FORK_SYNC_LOG,
 # FORK_SYNC_UPSTREAM_URL, FORK_SYNC_MIN_AGE_DAYS, FORK_SYNC_HEALTH_TIMEOUT, FORK_SYNC_NOTIFY=0,
-# FORK_SYNC_UNSAFE_ANY_CHECKOUT=1 (skips the ownership guard; tests only, and only
+# FORK_SYNC_NO_PUSH=1 (deploy without pushing; for rollback drills on a local-only
+# commit), FORK_SYNC_UNSAFE_ANY_CHECKOUT=1 (skips the ownership guard; tests only, and only
 # with a compose file that cannot build: images and containers are global).
 #
 # Writes $STATE_DIR/status.json (read by the Hermes fork-sync-report cron job)
@@ -368,6 +369,7 @@ build_images() {
 push_fork() {
   STEP=push
   if [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ]; then return 0; fi
+  if [ "${FORK_SYNC_NO_PUSH:-0}" = 1 ]; then log "push skipped (FORK_SYNC_NO_PUSH: drills only)"; return 0; fi
   git push --quiet origin "HEAD:$BRANCH" ||
     { fail push "git push to origin failed; built but not deployed (next run retries)"; return 1; }
   log "pushed $BRANCH to origin"
