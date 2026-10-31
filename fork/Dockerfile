@@ -18,7 +18,7 @@ FROM hermes-base
 # min-release-age, which applies to the platform-native optional dependency
 # too), and the package's postinstall must be explicitly allowed (npm blocks
 # install scripts by default).
-ARG CLAUDE_CODE_VERSION=2.1.296
+ARG CLAUDE_CODE_VERSION=2.1.302
 RUN npm install -g --prefix /usr/local --no-audit --fetch-retries=5 \
         --allow-scripts=@anthropic-ai/claude-code \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
