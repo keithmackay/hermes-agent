@@ -11,12 +11,15 @@ import os
 import sys
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 HOME = os.environ.get("HERMES_HOME", "/opt/data")
 SHARE = os.path.join(HOME, "fork-sync")
 MARKER = os.path.join(HOME, "fork-sync-report.last")  # outside the share: writes there wake launchd
 STUCK_TRIGGER_SECS = 30 * 60
 STUCK_RUN_SECS = 2 * 60 * 60
+# The container clock is UTC; Hermes passes its configured zone to cron scripts.
+TZ = ZoneInfo(os.environ["HERMES_TIMEZONE"]) if os.environ.get("HERMES_TIMEZONE") else None
 
 
 def mtime(name):
@@ -27,7 +30,7 @@ def mtime(name):
 
 
 def ago(ts):
-    return datetime.fromtimestamp(ts).strftime("%a %H:%M")
+    return datetime.fromtimestamp(ts, TZ).strftime("%a %H:%M %Z")
 
 
 def main():

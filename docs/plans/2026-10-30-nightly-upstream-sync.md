@@ -1,6 +1,6 @@
 # Plan: nightly upstream sync and rebuild
 
-**Status:** Phases 1–4 done and live from 2026-10-31 04:00; Phase 5 (failure drills, multi-night soak) remaining
+**Status:** Phases 1–5 done and live from 2026-10-31 04:00; only the multi-night soak (Phase 5 step 5) is still to watch
 **Date:** 2026-10-30
 **Change log:** record each phase in [`docs/specs/fork-changes.md`](../specs/fork-changes.md) as it lands.
 
@@ -321,7 +321,29 @@ Delivery starts as `local` (`~/.hermes/cron/output/`). Switch the report job to 
 
 If the Mac is asleep at 04:00, Hermes fires the trigger once on wake (`cron.catch_up_missed` defaults to true).
 
-## Phase 5: test before trusting it
+## Phase 5: test before trusting it, DRILLS DONE 2026-10-31
+
+**Live drills** (against the real checkout and container; drill commits were local only and removed after):
+
+| Drill | Setup | Result |
+|---|---|---|
+| A. Dirty tree | edited a tracked file | `skipped preflight`, notification; HEAD, tree and container unchanged |
+| B. Broken build | local commit adding `RUN false` to `fork/Dockerfile` | `failed build`; nothing pushed (GitHub unchanged); old container kept serving, healthy |
+| C. Unhealthy image | local commit with `ENTRYPOINT ["sleep","infinity"]`, `FORK_SYNC_NO_PUSH=1`, 60 s health limit | deployed, unhealthy after 60 s, **rolled back to the previous image, healthy 6 s later**; rejected image kept as `mac-failed` (then removed); nothing pushed |
+| D. Trigger never picked up | launchd agent unloaded, trigger dated 40 min back, report job run | report: "the trigger from … was never picked up by the Mac …"; agent reinstalled |
+
+Drill D found that the report printed times in the container's UTC. Hermes passes `HERMES_TIMEZONE` to
+cron scripts (checked with a throwaway probe job), so the report now formats times in that zone ("Fri
+23:38 EDT"). A merge-conflict drill wasn't repeated live (upstream was 0 commits ahead); the clone test
+in Phase 2 covers it. Not drilled: Docker down (it would mean stopping Docker Desktop) and a push failure
+(simple path: fail, don't deploy, retry next run).
+
+Added test override `FORK_SYNC_NO_PUSH=1` (`935abcc3f9`) so drill C could deploy a local-only commit.
+
+**Still to watch:** a few real nights. Check the 05:00 reports, `status.json`, and
+`~/Library/Logs/hermes-fork-sync.log`.
+
+Original steps:
 
 1. `fork/sync/fork-sync.sh --dry-run` prints the upstream commit count, any merge conflicts, and the chosen Claude Code version.
 2. `fork/sync/fork-sync.sh --force-run` does a real run by hand while watching the log.
