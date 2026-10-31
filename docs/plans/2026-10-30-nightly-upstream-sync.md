@@ -1,6 +1,6 @@
 # Plan: nightly upstream sync and rebuild
 
-**Status:** Phases 1–3 done (2026-10-30/31); Phases 4–5 not started
+**Status:** Phases 1–4 done and live from 2026-10-31 04:00; Phase 5 (failure drills, multi-night soak) remaining
 **Date:** 2026-10-30
 **Change log:** record each phase in [`docs/specs/fork-changes.md`](../specs/fork-changes.md) as it lands.
 
@@ -268,7 +268,31 @@ with `launchctl bootstrap gui/$(id -u) <plist>`:
 Optional safety net: on the `StartInterval` path, if no trigger has arrived in 36 h, show a macOS
 notification ("Hermes nightly sync hasn't been triggered: is the container running?").
 
-## Phase 4: Hermes cron jobs
+## Phase 4: Hermes cron jobs, DONE 2026-10-31
+
+**As built:**
+- Mounts added to `fork/docker-compose.mac.yml`: `${HOME}/.local/state/hermes-fork-sync` → `/opt/data/fork-sync`
+  (rw) and `fork/hermes-scripts` → `/opt/data/scripts/fork` (ro). `/opt/data/scripts` was created first as
+  the hermes user, so Docker didn't create it as root. The image's startup chown only touches its own
+  listed subdirectories (`docker/stage2-hook.sh`), so the mounts are left alone. Verified: `scripts/` is
+  still writable by hermes, `scripts/fork/` is read-only, and UID 10000 can write to the share (files show
+  up owned by the Mac user on the host).
+- `fork-sync-trigger.sh` just writes `trigger`. Atomicity isn't needed because the host never reads its
+  contents, and a temp-file-then-rename would wake launchd twice.
+- `fork-sync-report.py` (a `.py` file runs under Hermes's Python) stays silent on no-ops, repeats (marker
+  at `$HERMES_HOME/fork-sync-report.last`, outside the share so it doesn't wake launchd), and runs still in
+  flight. It flags a trigger not picked up after 30 min, a run stuck for more than 2 h, and a trigger that
+  was taken but never produced a result.
+- Jobs: `fork-sync-trigger` (`1347d7c5fa27`, `0 4 * * *`) and `fork-sync-report` (`2c1b3594db1d`,
+  `0 5 * * *`), both `--no-agent --deliver local`, catch-up on (the default). Next runs shown in −04:00.
+
+**Verified end to end:** `hermes cron run 1347d7c5fa27`, then launchd started the sync about 2 s later,
+deploying `335cf1e5a5` (healthy). `hermes cron run 2c1b3594db1d` delivered "Fork sync OK: Deployed
+335cf1e5a5", and a second run was silent. Report logic unit-tested in 10 cases against fake shares.
+
+**Reading reports:** with `local` delivery, output is in `/opt/data/cron/output/<job id>/` (silent ticks
+are recorded as "silent (empty output)"). Once a messaging platform is set up in Hermes, run
+`hermes cron edit 2c1b3594db1d --deliver <platform>`.
 
 First add the two mounts deferred from Phase 1 to `fork/docker-compose.mac.yml`
 (`~/.local/state/hermes-fork-sync:/opt/data/fork-sync` and
