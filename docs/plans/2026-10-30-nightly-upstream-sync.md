@@ -1,6 +1,6 @@
 # Plan: nightly upstream sync and rebuild
 
-**Status:** Phases 1–2 done, plus the first real sync run (2026-10-30); Phases 3–5 not started
+**Status:** Phases 1–3 done (2026-10-30/31); Phases 4–5 not started
 **Date:** 2026-10-30
 **Change log:** record each phase in [`docs/specs/fork-changes.md`](../specs/fork-changes.md) as it lands.
 
@@ -235,7 +235,24 @@ Steps, stopping at the first failure:
 `--dry-run` runs steps 1 to 6 against a throwaway `git worktree` (merging with `--no-commit`), prints
 what it would do, and never builds, pushes, or touches the working copy.
 
-## Phase 3: launchd agent
+## Phase 3: launchd agent, DONE 2026-10-31
+
+**As built:** `fork/sync/com.keithmackay.hermes-fork-sync.plist` is a template. `fork/sync/install-launchd.sh`
+fills in absolute paths, writes it to `~/Library/LaunchAgents/`, and bootstraps it (re-runnable;
+`--uninstall` removes it). It runs `/bin/bash fork-sync.sh` directly, since the script sets its own PATH
+and doesn't need a login shell. Early output goes to `~/Library/Logs/hermes-fork-sync.launchd.log`. The
+optional 36 h no-trigger alarm is built into `fork-sync.sh`: `last_trigger` is touched on each consumed
+trigger, armed by the installer, and notifies at most once a day.
+
+**Verified through launchd:**
+- a no-trigger run exits 0 and logs nothing
+- the stale alarm fires once and stays quiet on the repeat
+- **a trigger written from inside a container through the bind mount fires `WatchPaths` in about 6 s**
+  (the open question above, so the `StartInterval` fallback is only a backstop)
+- the triggered run completed end to end under launchd (SSH fetches of origin and upstream worked;
+  deployed `2b82b2d96f`, healthy)
+
+A push under launchd hasn't happened yet (nothing to push), but it uses the same SSH key that the fetch just used.
 
 `fork/sync/com.keithmackay.hermes-fork-sync.plist`, installed to `~/Library/LaunchAgents/` and loaded
 with `launchctl bootstrap gui/$(id -u) <plist>`:
