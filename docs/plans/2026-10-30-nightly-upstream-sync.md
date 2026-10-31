@@ -1,6 +1,6 @@
 # Plan: nightly upstream sync and rebuild
 
-**Status:** Phases 1–2 done (2026-10-30); Phases 3–5 not started
+**Status:** Phases 1–2 done, plus the first real sync run (2026-10-30); Phases 3–5 not started
 **Date:** 2026-10-30
 **Change log:** record each phase in [`docs/specs/fork-changes.md`](../specs/fork-changes.md) as it lands.
 
@@ -191,7 +191,10 @@ succeeded and the script built and **redeployed the live `hermes` container** fr
 bare origin; GitHub and the real checkout were untouched. Because of the tag-ordering bug above, the
 previous image was lost, and the new code had already migrated Hermes config v51 → v52 in `hermes-data`.
 Fixes: the ownership guard, tagging before the build, and the test rule "clones must never have a
-buildable compose file", now in `.claude/CLAUDE.md`.
+buildable compose file", now in `.claude/CLAUDE.md`. Resolved the same evening by a real
+`--force-run` from this checkout (merged 2,313 upstream commits, Claude Code 2.1.302, healthy). That run
+first stopped at preflight because a global `url.*.insteadOf` rule rewrote the upstream URL; fixed by
+comparing the stored `remote.upstream.url`.
 
 Wrap the whole body in `main() { ... }; main "$@"`. Bash reads scripts as it runs them, and the merge
 can rewrite this very file mid-run. Support `--dry-run` and `--force-run` (ignore the missing trigger).
