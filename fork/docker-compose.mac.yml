@@ -41,6 +41,12 @@ services:
       - "127.0.0.1:9119:9119"   # dashboard
     volumes:
       - hermes-data:/opt/data
+      # Nightly fork sync (docs/plans/2026-10-30-nightly-upstream-sync.md): the
+      # Hermes cron jobs drop a trigger here and read status.json back. The Mac's
+      # launchd agent watches the host side. Nested inside the volume; the image's
+      # startup chown only touches its own listed subdirs, so these are left alone.
+      - ${HOME}/.local/state/hermes-fork-sync:/opt/data/fork-sync
+      - ./hermes-scripts:/opt/data/scripts/fork:ro
     env_file: ${HOME}/.config/hermes-fork/env.mac
     environment:
       - HERMES_DASHBOARD=1
