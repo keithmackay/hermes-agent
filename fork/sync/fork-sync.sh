@@ -54,8 +54,9 @@ main() {
   mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
 
   # Trigger mode exits silently (no log, no status) when there is nothing to do,
-  # so the 15-minute launchd fallback stays quiet.
+  # so the 15-minute launchd fallback stays quiet, except for the staleness alarm.
   if [ "$mode" = trigger ] && [ ! -e "$STATE_DIR/trigger" ]; then
+    check_trigger_staleness
     return 0
   fi
 
@@ -64,6 +65,7 @@ main() {
 
   if [ "$mode" = trigger ]; then
     mv "$STATE_DIR/trigger" "$STATE_DIR/processing" 2>/dev/null || { log "trigger already taken"; return 0; }
+    touch "$STATE_DIR/last_trigger"; rm -f "$STATE_DIR/stale_notified"
   fi
 
   if [ "$mode" = dry ]; then
@@ -133,6 +135,19 @@ acquire_lock() {
   fi
   log "removing stale lock (pid ${pid:-unknown})"
   rm -rf "$lock" && mkdir "$lock" && echo $$ > "$lock/pid" && LOCK_HELD=1
+}
+
+# If Hermes hasn't dropped a trigger in 36 h (container down, cron job paused or
+# removed), say so, at most once a day. Armed by install-launchd.sh, which
+# creates last_trigger; until then there is nothing to compare against.
+check_trigger_staleness() {
+  local last="$STATE_DIR/last_trigger" mark="$STATE_DIR/stale_notified"
+  [ -e "$last" ] || return 0
+  [ -n "$(find "$last" -mmin +2160 2>/dev/null)" ] || return 0
+  if [ -e "$mark" ] && [ -z "$(find "$mark" -mmin +1440 2>/dev/null)" ]; then return 0; fi
+  touch "$mark"
+  printf '%s %s\n' "$(date '+%F %T')" "WARNING: no trigger from Hermes in 36h+" >> "$LOG"
+  notify "No nightly sync trigger from Hermes in 36h+. Is the hermes container running and the fork-sync-trigger cron job enabled?"
 }
 
 # fail STEP MESSAGE: record a failure; the caller returns 1.

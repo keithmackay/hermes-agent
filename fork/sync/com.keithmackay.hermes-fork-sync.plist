@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the nightly fork sync. TEMPLATE: install with
+  fork/sync/install-launchd.sh, which replaces __REPO__ and __HOME__ with
+  absolute paths (launchd expands neither ~ nor $HOME).
+
+  Fires when anything changes in the state folder (the Hermes 04:00 cron job
+  drops `trigger` there through a bind mount), and every 15 minutes as a
+  fallback. fork-sync.sh exits silently when there is no trigger.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.keithmackay.hermes-fork-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/fork/sync/fork-sync.sh</string>
+  </array>
+
+  <key>WatchPaths</key>
+  <array>
+    <string>__HOME__/.local/state/hermes-fork-sync</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- fork-sync.sh logs to ~/Library/Logs/hermes-fork-sync.log itself; this
+       only catches anything printed before it redirects its output. -->
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/hermes-fork-sync.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/hermes-fork-sync.launchd.log</string>
+</dict>
+</plist>
