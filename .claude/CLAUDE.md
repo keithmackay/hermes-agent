@@ -13,3 +13,6 @@ This is a fork of NousResearch/hermes-agent. Upstream's contributor guide is `AG
 - Testing `fork/sync/fork-sync.sh`: Docker image and container names are global, so a test clone can
   rebuild and redeploy the live container. Test clones must never have a buildable compose file;
   commit a deliberately broken `fork/docker-compose.mac.yml` in each clone first.
+- Hermes timezone must be set in Hermes config (`hermes config set timezone America/New_York`, stored in the
+  `hermes-data` volume). The cron scheduler ignores compose's `HERMES_TIMEZONE`. If cron jobs show `+00:00` next
+  runs, re-set it, restart, and re-save the schedules (`hermes cron edit <id> --schedule ...`).
