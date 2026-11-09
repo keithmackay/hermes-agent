@@ -828,6 +828,36 @@ class TestReplacingRuns:
             process_registry.kill_all(session_id, source="test_cleanup")
 
 
+class TestRestartRebind:
+    @pytest.mark.asyncio
+    async def test_connecting_rebinds_the_checkout_of_a_dispatch_run_still_to_run(self, harness):
+        from tools.terminal_tool import clear_task_env_overrides, resolve_task_overrides
+        assert (await harness.post(_dispatch())).status == 202
+        session_id = _session_id(harness, harness.admitted[0])
+        workspace = resolve_task_overrides(session_id)["cwd"]
+        clear_task_env_overrides(session_id)  # the process restarted: in-memory bindings are gone
+        harness.adapter._snugban_receivers.clear()
+        assert await harness.adapter.connect()
+        try:
+            assert resolve_task_overrides(session_id).get("cwd") == workspace
+        finally:
+            await harness.adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connecting_binds_nothing_for_a_run_that_ended(self, harness):
+        from tools.terminal_tool import clear_task_env_overrides, resolve_task_overrides
+        assert (await harness.post(_dispatch())).status == 202
+        session_id = _session_id(harness, harness.admitted[0])
+        await _end_run(harness, harness.admitted[0])
+        await _reports_done(harness)
+        clear_task_env_overrides(session_id)
+        assert await harness.adapter.connect()
+        try:
+            assert "cwd" not in resolve_task_overrides(session_id)
+        finally:
+            await harness.adapter.disconnect()
+
+
 class TestRestart:
     """The receiver forgets everything on a gateway restart; durable admission does not."""
 

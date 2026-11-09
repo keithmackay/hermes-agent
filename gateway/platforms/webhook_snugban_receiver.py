@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -67,6 +68,42 @@ def _admitted(payload: dict) -> dict:
     """The webhook as admitted: without its per-attempt ``deliveryId``, so Snugban's resend (same
     dispatchId or questionId, new deliveryId) is the same delivery to durable admission."""
     return {key: value for key, value in payload.items() if key != "deliveryId"}
+
+
+def rebind_workspaces(adapter) -> int:
+    """Bind each Snugban dispatch run that is not over (queued, started, or interrupted by the last
+    shutdown) to its dispatch's checkout again: the binding lives in memory, and durable admission resumes
+    such runs after a restart before Snugban resends anything. Returns how many runs were bound."""
+    from gateway.session_authorities import all_authorities
+    runner = adapter.gateway_runner or getattr(getattr(adapter, "_message_handler", None), "__self__", None)
+    bound = 0
+    for authority in all_authorities(runner) if runner is not None else []:
+        rows = authority.db._read_all(
+            "SELECT target_session_id, payload_json FROM session_admissions "
+            "WHERE request_id LIKE 'snugban:%' AND status != 'terminal'")
+        for row in rows:
+            source = json.loads(row["payload_json"]).get("native_text_v1", {}).get("source", {})
+            found = webhook_delivery_of(str(source.get("chat_id") or ""))
+            dispatch_id = dispatch_of_delivery(found[2]) if found else None
+            route_config = adapter._routes.get(found[1]) if found else None
+            if dispatch_id is None or not isinstance(snugban_block(route_config), dict):
+                continue
+            profile = None if found[0] == "default" else found[0]
+            with adapter._profile_scope(profile):
+                workspace = dispatch_workspace(route_config, found[1], dispatch_id)
+            if workspace.is_dir():
+                session_id = row["target_session_id"]
+                for task_id in {session_id, authority.db.resolve_resume_session_id(session_id)}:
+                    _bind_task_cwd(task_id, workspace)
+                bound += 1
+    return bound
+
+
+def _bind_task_cwd(task_id: str, workspace) -> None:
+    """Make *workspace* the cwd of *task_id*'s terminal and file tools (they resolve it from the task's
+    overrides; a gateway turn's task id is its session id)."""
+    from tools.terminal_tool import register_task_env_overrides, resolve_task_overrides
+    register_task_env_overrides(task_id, {**resolve_task_overrides(task_id), "cwd": str(workspace)})
 
 
 class _Run:
@@ -163,10 +200,20 @@ class SnugbanReceiver:
             return dispatch_workspace(self._route_config(), self._route_name, dispatch_id)
 
     def _remove_workspace(self, dispatch_id: str) -> None:
+        """Move the checkout aside at once, then delete it in the background: a resend of the dispatch can then
+        check out afresh without meeting a half-deleted folder."""
         workspace = self._workspace(dispatch_id)
-        if workspace.exists():
-            logger.info("[webhook] Removing the checkout of Snugban dispatch %s", dispatch_id)
-            self._spawn(asyncio.to_thread(shutil.rmtree, workspace, True), f"snugban-cleanup-{dispatch_id}")
+        if not workspace.exists():
+            return
+        logger.info("[webhook] Removing the checkout of Snugban dispatch %s", dispatch_id)
+        doomed = workspace.with_name(f".removing-{dispatch_id}-{uuid.uuid4().hex[:8]}")
+        try:
+            workspace.rename(doomed)
+        except OSError:
+            logger.warning("[webhook] Could not move the checkout of Snugban dispatch %s aside", dispatch_id,
+                           exc_info=True)
+            doomed = workspace
+        self._spawn(asyncio.to_thread(shutil.rmtree, doomed, True), f"snugban-cleanup-{dispatch_id}")
 
     # --- entry point ---
 
@@ -251,10 +298,8 @@ class SnugbanReceiver:
         """Make the dispatch's checkout the run's working directory. Called as the run is committed, before it
         can execute: its terminal and file tools resolve their cwd from the overrides of its task id, which
         is its session id."""
-        from tools.terminal_tool import register_task_env_overrides, resolve_task_overrides
         if run.session_id:
-            register_task_env_overrides(run.session_id, {**resolve_task_overrides(run.session_id),
-                                                         "cwd": str(self._workspace(dispatch.id))})
+            _bind_task_cwd(run.session_id, self._workspace(dispatch.id))
 
     async def _after_run(self, dispatch: _Dispatch, run: _Run) -> None:
         """A run of *dispatch* ended: keep the dispatch while it waits for Keith, else fail it if the run left
