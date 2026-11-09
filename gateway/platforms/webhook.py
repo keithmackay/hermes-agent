@@ -5,7 +5,7 @@ secret (REQUIRED; "INSECURE_NO_AUTH" skips validation, loopback only), prompt te
 deliver/deliver_extra, deliver_only (rendered prompt IS the message), cron_job (fire an existing cron
 job per event; the rendered prompt is transient per-run context; exclusive with deliver_only), mirror_to_session
 (opt-in: a delivered response is also written into the target chat's transcript so follow-ups there have
-context). Per-route rate limiting,
+context), snugban (Snugban's dispatch webhooks: ``webhook_snugban.py``). Per-route rate limiting,
 idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
 replay protection; body-only V1 is deprecated but accepted with a warning."""
 
@@ -25,7 +25,7 @@ from collections import deque
 from datetime import datetime, timezone, UTC
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 try:
     from aiohttp import web
@@ -43,6 +43,8 @@ from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coales
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.platforms.webhook_mcp_events import (
     handle_mcp_event_control, mcp_event_delivery_id, render_mcp_event_prompt)
+from gateway.platforms.webhook_snugban import (
+    handle_snugban_delivery, snugban_block, snugban_route_problem, snugban_signature_valid)
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
@@ -242,6 +244,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(script_timeout_seconds=self._script_timeout_seconds)
         # Opt-in per-route debounce of rapid same-entity events (route ``coalesce`` block). #92066
         self._coalescer = WebhookCoalescer(dispatch=self._spawn_agent_run, render=self._render_prompt)
+        self._snugban_receivers: dict = {}  # (profile, route) -> SnugbanReceiver, made on first delivery
 
     @property
     def token(self):
@@ -256,6 +259,8 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_route(self, name: str, route: dict) -> None:
         """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
         secret = route.get("secret", self._global_secret)
+        if problem := snugban_route_problem(route, secret):
+            raise ValueError(f"[webhook] Route '{name}' (snugban) cannot start: {problem}")
         if not _is_usable_secret(secret):
             raise ValueError(f"[webhook] Route '{name}' HMAC secret is missing, blank, or not a string. Set 'secret' "
                              f"on the route or globally. "
@@ -418,6 +423,9 @@ class WebhookAdapter(BasePlatformAdapter):
         """Reject dynamic routes whose effective secret is missing, blank, or not a string
         (_is_usable_secret); INSECURE_NO_AUTH is loopback-only."""
         effective_secret = route.get("secret", self._global_secret)
+        if problem := snugban_route_problem(route, effective_secret):
+            logger.warning("[webhook] Dynamic route '%s' (snugban) skipped: %s", name, problem)
+            return False
         if not _is_usable_secret(effective_secret):
             logger.warning("[webhook] Dynamic route '%s' skipped: 'secret' is missing, blank, or not a string. "
                            "Set a valid HMAC secret, or use '%s' to explicitly disable auth (testing only).",
@@ -552,6 +560,14 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] Route %s HMAC secret is missing, blank, or not a string; refusing request",
                          route_name)
             return None, _json_error("Webhook route is missing an HMAC secret", 403)
+        if snugban_block(route_config) is not None:
+            # A Snugban route takes Snugban's own signature only (startup refused it any unusable secret).
+            if snugban_route_problem(route_config, secret):
+                return None, _json_error("Webhook route is missing an HMAC secret", 403)
+            if not snugban_signature_valid(request.headers, raw_body, secret):
+                logger.warning("[webhook] Invalid Snugban signature for route %s", route_name)
+                return None, _json_error("Invalid signature", 401)
+            return raw_body, None
         if secret != _INSECURE_NO_AUTH and not self._validate_signature(request, raw_body, secret):
             logger.warning("[webhook] Invalid signature for route %s", route_name)
             return None, _json_error("Invalid signature", 401)
@@ -687,6 +703,9 @@ class WebhookAdapter(BasePlatformAdapter):
         payload = self._parse_body(raw_body)
         if payload is _UNPARSEABLE:
             return _json_error("Cannot parse body", 400)
+        snugban = await handle_snugban_delivery(self, request, route_name, route_config, payload, profile)
+        if snugban is not None:
+            return snugban
         mcp_control = await handle_mcp_event_control(self, route_name, route_config, payload, profile)
         if mcp_control is not None:
             return mcp_control
@@ -792,9 +811,11 @@ class WebhookAdapter(BasePlatformAdapter):
         return source
 
     async def _admit_agent_run(self, payload: Any, prompt: str, delivery_id: str, now: float, *, route_config: dict,
-                               route_name: str, profile, event_type: str) -> Optional[str]:
+                               route_name: str, profile, event_type: str,
+                               on_settled: Optional[Callable[[], None]] = None) -> Optional[str]:
         """Record delivery info and admit the run through the durable producer (shared by the immediate
-        and coalesced paths). ``"accepted"`` / ``"duplicate"``, or None when admission failed."""
+        and coalesced paths). ``"accepted"`` / ``"duplicate"``, or None when admission failed.
+        ``on_settled`` is called once an accepted run has ended."""
         # (profile, route, delivery_id) in the session key → concurrent webhooks get independent runs.
         identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
         session_chat_id = identity.session_chat_id
@@ -827,6 +848,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 from gateway.platforms.webhook_delivery import snapshot_destination
                 await self._deliver_to(snapshot_destination(self, self._delivery_info.get(session_chat_id)),
                                        session_chat_id, reply)
+            if on_settled is not None:
+                on_settled()
             return "accepted"
         from gateway.session_authorities import active_authority, authority_for_profile_id
         runner = self._message_handler.__self__
@@ -834,6 +857,9 @@ class WebhookAdapter(BasePlatformAdapter):
         task = asyncio.create_task(self._finalize_delivery(event, authority, receipt))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        if on_settled is not None:
+            # A cancelled finalization is a shutdown, not the run ending: the run resumes after restart.
+            task.add_done_callback(lambda done: None if done.cancelled() else on_settled())
         return "accepted"
 
     async def _finalize_delivery(self, event, authority, receipt):
