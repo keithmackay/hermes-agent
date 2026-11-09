@@ -906,6 +906,18 @@ class TestRestart:
         assert agent.interrupts
 
     @pytest.mark.asyncio
+    async def test_an_abort_after_a_restart_stops_a_queued_resumed_session_when_it_starts(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
+        await _end_run(harness, harness.admitted[0])
+        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
+        self._restart(harness)
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        agent = FakeAgent()
+        harness.run_agent(harness.admitted[1], agent)  # the queued resumed run starts after the abort
+        await async_wait_until(lambda: agent.interrupts, timeout=10, what="the late resumed run to be stopped")
+
+    @pytest.mark.asyncio
     async def test_an_abort_after_a_restart_stops_a_resumed_session_too(self, harness):
         assert (await harness.post(_dispatch())).status == 202
         assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200

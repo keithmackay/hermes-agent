@@ -393,8 +393,16 @@ class SnugbanReceiver:
         self._spawn(_enforce(), f"snugban-stop-{delivery_id}")
 
     def _sessions_of(self, dispatch_id: str) -> set:
-        """Delivery ids of the sessions of *dispatch_id*: its first run's, and any running one's."""
+        """Delivery ids of the sessions of *dispatch_id*: its first run's, any admitted run's that is not over
+        (a resume or answer run still queued included), and any running one's."""
+        from gateway.session_authorities import all_authorities
         deliveries = {f"snugban:dispatch:{dispatch_id}"}
+        for authority in all_authorities(self._runner()):
+            rows = authority.db._read_all(
+                "SELECT request_id FROM session_admissions WHERE request_id LIKE ? AND status != 'terminal'",
+                (f"snugban:%:{dispatch_id}%",))
+            deliveries.update(row["request_id"] for row in rows
+                              if dispatch_of_delivery(row["request_id"]) == dispatch_id)
         profile = self._profile or "default"
         for key in self._runner()._snapshot_running_agents():
             found = webhook_delivery_of(key)
