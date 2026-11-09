@@ -558,6 +558,12 @@ async def _end_run(harness, event, status: str = "terminal") -> None:
     authority.db._execute_write(lambda conn: conn.execute(
         "UPDATE session_admissions SET status=? WHERE admission_id=?", (status, row["admission_id"])))
     waiter.set_result(None)
+    # The run has ended once the receiver following it saw it end and handled that.
+    runs = [d.run for receiver in harness.adapter._snugban_receivers.values()
+            for d in receiver._dispatches.values() if d.run is not None and d.run.delivery_id == event.message_id]
+    await async_wait_until(lambda: all(run.ended.is_set() for run in runs) and not any(
+        t.get_name().startswith("snugban-ended") for t in harness.adapter._background_tasks),
+        timeout=10, what="the run's end to be handled")
 
 
 async def _reports_done(harness) -> None:
