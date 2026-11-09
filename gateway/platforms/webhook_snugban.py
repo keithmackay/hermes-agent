@@ -77,6 +77,9 @@ def snugban_route_problem(route_config: dict, secret: Any) -> Optional[str]:
     root = block.get("workspace_root")
     if root is not None and (not _is_set(root) or not Path(root).expanduser().is_absolute()):
         return "snugban.workspace_root must be an absolute directory (each dispatch gets a checkout under it)"
+    remote_base = block.get("git_remote_base")
+    if remote_base is not None and (not _is_set(remote_base) or any(c.isspace() for c in remote_base)):
+        return "snugban.git_remote_base must be a URL prefix such as https://github.com/ or git@github.com:"
     if not _is_set(block.get("agent_key")):
         return ("snugban.agent_key is missing, blank or an unset ${...} reference; set it to the agent key "
                 "Snugban issued (e.g. agent_key: \"${SNUGBAN_AGENT_KEY}\" with the variable in .env)")
@@ -113,6 +116,12 @@ def dispatch_workspace(route_config: dict, route_name: str, dispatch_id: str) ->
         from hermes_constants import get_hermes_home
         base = get_hermes_home() / "snugban-checkouts" / route_name
     return base / dispatch_id
+
+
+def remote_url(route_config: dict, repo: str) -> str:
+    """The URL a dispatch's repository is cloned from: ``snugban.git_remote_base`` (default
+    ``https://github.com/``) + ``owner/name.git``."""
+    return f"{snugban_block(route_config).get('git_remote_base') or 'https://github.com/'}{repo}.git"
 
 
 def snugban_signature_valid(headers, body: bytes, secret: str, now: Optional[float] = None) -> bool:
@@ -194,14 +203,12 @@ def _dispatch_prompt(payload: dict, workspace: Path, *, intro: Optional[str] = N
     lines += [
         "", f"Dispatch id: {dispatch_id}", f"Branch: {branch}",
         f"Repository: {repo or '(none given)'}; base branch: {project.get('defaultBranch') or '(not given)'}",
-        f"Working directory: {workspace} (this dispatch's own checkout; your terminal starts there)",
+        f"The checkout is ready at {workspace}, on branch {branch}; your terminal starts there.",
         "", "How to work it:",
-        f"0. Keep all work for this dispatch in {workspace}. If it is empty, clone the repository into it "
-        f"(for example `gh repo clone {repo or '<owner>/<name>'} .`); if it holds a checkout, continue in it. "
-        "Never work on this branch in any other directory.",
+        f"0. Work only in {workspace}; never cd elsewhere. cd {workspace} before any git command.",
         f"1. The receiver has already acknowledged the dispatch. If unsure, call "
         f"mcp__snugban__acknowledge_dispatch with dispatchId {dispatch_id}; doing it again changes nothing.",
-        f"2. Work on branch {branch}: continue it if it exists, otherwise create it from the base branch.",
+        f"2. Stay on branch {branch}.",
         "3. Do the work the task data describes, until its definition of done (dodCriteria) is met.",
         f"4. Call mcp__snugban__report_progress (dispatchId {dispatch_id}, message, percent) when there is news, "
         f"and mcp__snugban__heartbeat with dispatchId {dispatch_id} at least every minute otherwise.",

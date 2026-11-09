@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -17,7 +18,8 @@ from gateway.platforms.webhook_snugban import (
     _ACTED_ON_TTL_SECONDS, _DEFAULT_HEARTBEAT_SECONDS, _DELIVERY_HEADER, _DELIVERY_TTL_SECONDS, _ID_RE,
     _MAX_REMEMBERED, _SIGNATURE_HEADER, ANSWERED_INTRO, RESUMED_INTRO, SnugbanClient, _decision_prompt,
     _decision_text, _dispatch_prompt, _Invalid, _json, _require_dispatch_shape, _valid_id, dispatch_of_delivery,
-    dispatch_workspace, snugban_block, webhook_delivery_of)
+    dispatch_workspace, remote_url, snugban_block, webhook_delivery_of)
+from gateway.platforms.webhook_snugban_checkout import CheckoutError, git_env, prepare_checkout
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +100,7 @@ class _Run:
 class _Dispatch:
     id: str
     payload: Optional[dict]  # None for an abort of a dispatch never received here
-    state: str = "running"  # running | waiting_answer | paused | aborted | replaced | ended
+    state: str = "running"  # preparing | running | waiting_answer | paused | aborted | replaced | ended
     run: Optional[_Run] = None
     pending_decisions: list = field(default_factory=list)
     open_questions: set = field(default_factory=set)
@@ -148,10 +150,12 @@ class SnugbanReceiver:
 
     def _finish(self, dispatch: _Dispatch, state: str) -> None:
         """The dispatch is over here: nothing heartbeats it any more, and its checkout goes once no run works in
-        it (a run still stopping removes it when it ends, through ``_after_run``)."""
+        it (a run still stopping removes it when it ends, through ``_after_run``; one still being checked out,
+        when ``_take`` sees it ended)."""
+        preparing = dispatch.state == "preparing"
         dispatch.state, dispatch.ended_at = state, time.time()
         self._stop_heartbeat(dispatch)
-        if dispatch.run is None or dispatch.run.ended.is_set():
+        if not preparing and (dispatch.run is None or dispatch.run.ended.is_set()):
             self._remove_workspace(dispatch.id)
 
     def _workspace(self, dispatch_id: str):
@@ -412,26 +416,49 @@ class SnugbanReceiver:
             return _json({"status": "duplicate", "dispatchId": dispatch_id})
         if not await self._replace_runs_of_task(payload["task"]["id"]):
             return _json({"error": "An earlier run of this task is still stopping; retry this delivery"}, 503)
-        dispatch = self._dispatches[dispatch_id] = _Dispatch(dispatch_id, payload)
-        workspace = self._workspace(dispatch_id)
-        await asyncio.to_thread(workspace.mkdir, 0o700, True, True)
+        dispatch = self._dispatches[dispatch_id] = _Dispatch(dispatch_id, payload, state="preparing")
+        # Cloning can outlast the 10 s Snugban gives a webhook: answer now, check out and admit after.
+        self._spawn(self._take(dispatch), f"snugban-take-{dispatch_id}")
+        return _json({"status": "accepted", "dispatchId": dispatch_id}, 202)
+
+    async def _take(self, dispatch: _Dispatch) -> None:
+        """Check the dispatch out into its own folder, then admit its run and acknowledge it. A checkout that
+        cannot be made fails the dispatch; an admission that fails leaves it unacknowledged, so Snugban's
+        resend is taken again."""
+        payload, workspace = dispatch.payload, self._workspace(dispatch.id)
+        repo = (payload["project"].get("repo") or {}).get("githubRepo")
+        try:
+            if not repo:
+                raise CheckoutError("the project has no GitHub repository to check out")
+            with self._adapter._profile_scope(self._profile):
+                from tools.environments.local import served_profile_child_env
+                env = git_env(served_profile_child_env())
+            await asyncio.to_thread(prepare_checkout, workspace, remote_url(self._route_config(), repo), repo,
+                                    payload["branch"], payload["project"].get("defaultBranch"), env)
+        except (CheckoutError, OSError, subprocess.TimeoutExpired) as exc:
+            reason = str(exc) if isinstance(exc, CheckoutError) else f"{type(exc).__name__} preparing the folder"
+            logger.warning("[webhook] Snugban dispatch %s: no checkout: %s", dispatch.id, reason)
+            self._finish(dispatch, "ended")
+            self._remove_workspace(dispatch.id)
+            self._report(dispatch.id, "fail", {"reason": f"Hermes could not prepare the checkout: {reason}"})
+            return
+        if dispatch.state != "preparing":  # aborted or replaced while it was being checked out
+            self._finish(dispatch, dispatch.state)
+            return
         outcome = await self._start_run(dispatch, _dispatch_prompt(payload, workspace),
-                                        f"snugban:dispatch:{dispatch_id}")
+                                        f"snugban:dispatch:{dispatch.id}")
         if outcome is None:
-            self._dispatches.pop(dispatch_id, None)  # not admitted: Snugban's resend must be taken
-            return _json({"error": "Admission unavailable; retry this delivery"}, 503)
+            self._dispatches.pop(dispatch.id, None)  # not admitted: Snugban's resend must be taken
+            return
         if outcome == "ended":
             # Taken before a restart and its run is over: nothing works it here, so it is not held.
-            self._dispatches.pop(dispatch_id, None)
-            self._remove_workspace(dispatch_id)
-            logger.info("[webhook] Snugban dispatch %s was run here before and that run has ended", dispatch_id)
-            return _json({"status": "duplicate", "dispatchId": dispatch_id})
-        self._report(dispatch_id, "ack")
-        if outcome == "duplicate":
-            logger.info("[webhook] Snugban dispatch %s: adopted its run from before a restart", dispatch_id)
-            return _json({"status": "duplicate", "dispatchId": dispatch_id})
-        logger.info("[webhook] Snugban dispatch %s accepted on route %s", dispatch_id, self._route_name)
-        return _json({"status": "accepted", "dispatchId": dispatch_id}, 202)
+            self._dispatches.pop(dispatch.id, None)
+            self._remove_workspace(dispatch.id)
+            logger.info("[webhook] Snugban dispatch %s was run here before and that run has ended", dispatch.id)
+            return
+        self._report(dispatch.id, "ack")
+        logger.info("[webhook] Snugban dispatch %s %s on route %s", dispatch.id,
+                    "adopted from before a restart" if outcome == "duplicate" else "accepted", self._route_name)
 
     async def _replace_runs_of_task(self, task_id: Any) -> bool:
         """A new dispatch of a task replaces any earlier one held here (Snugban sends work back as a new
@@ -440,7 +467,7 @@ class SnugbanReceiver:
         same_task = [d for d in self._dispatches.values()
                      if d.payload is not None and d.payload["task"].get("id") == task_id]
         for dispatch in same_task:
-            if dispatch.state in ("running", "waiting_answer", "paused"):
+            if dispatch.state in ("preparing", "running", "waiting_answer", "paused"):
                 logger.info("[webhook] Snugban dispatch %s is replaced by a new dispatch of its task", dispatch.id)
                 self._finish(dispatch, "replaced")
                 if dispatch.run is not None and not dispatch.run.ended.is_set():

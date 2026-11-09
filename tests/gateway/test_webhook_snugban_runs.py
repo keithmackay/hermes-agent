@@ -46,6 +46,21 @@ def _signed(payload):
                   "X-Snugban-Timestamp": timestamp, "X-Snugban-Signature": f"sha256={digest}"}
 
 
+def _make_remote(bare):
+    """A bare repository standing in for GitHub, with one commit on main."""
+    def git(*args, cwd):
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args], cwd=cwd,
+                       check=True, capture_output=True, stdin=subprocess.DEVNULL)
+    bare.parent.mkdir(parents=True)
+    git("init", "--quiet", "--bare", "--initial-branch=main", str(bare), cwd=bare.parent)
+    work = bare.parent / "work"
+    git("clone", "--quiet", str(bare), str(work), cwd=bare.parent)
+    (work / "README.md").write_text("demo\n")
+    git("add", "README.md", cwd=work)
+    git("commit", "--quiet", "-m", "start", cwd=work)
+    git("push", "--quiet", "origin", "HEAD:main", cwd=work)
+
+
 async def probe(model, root):
     import aiohttp
     from aiohttp import web
@@ -71,11 +86,13 @@ async def probe(model, root):
 
     runner = GatewayRunner()
     await initialize_session_authority(runner, profile_id="default", instance_id="snugban-runs")
-    checkouts = root / "checkouts"
+    checkouts, remotes = root / "checkouts", root / "remotes"
+    _make_remote(remotes / "keithmackay" / "demo.git")
     adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={
         "host": "127.0.0.1", "port": 0, "routes": {"snugban": {
             "secret": SECRET, "toolsets": ["terminal"],
-            "snugban": {"base_url": snugban_url, "agent_key": AGENT_KEY, "workspace_root": str(checkouts)}}}}))
+            "snugban": {"base_url": snugban_url, "agent_key": AGENT_KEY, "workspace_root": str(checkouts),
+                        "git_remote_base": f"file://{remotes}/"}}}}))
     adapter.gateway_runner = runner
     runner.adapters[Platform.WEBHOOK] = adapter
     runner._wire_adapter_handlers(adapter)

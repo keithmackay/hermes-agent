@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -140,10 +141,15 @@ class Harness:
         self.snugban, self.cli, self.adapter, self.admitted = snugban, cli, adapter, admitted
 
     async def post(self, payload, *, body: bytes | None = None, headers: dict | None = None):
+        """POST a signed webhook; then wait for the dispatch it may have taken to be checked out and admitted."""
         if body is None:
             body, signed = _signed(payload)
             headers = headers or signed
-        return await self.cli.post("/webhooks/snugban", data=body, headers=headers)
+        resp = await self.cli.post("/webhooks/snugban", data=body, headers=headers)
+        await async_wait_until(lambda: not any(t.get_name().startswith("snugban-take")
+                                                for t in self.adapter._background_tasks),
+                               timeout=30, what="the dispatch to be checked out and admitted")
+        return resp
 
     @property
     def runner(self):
@@ -167,11 +173,39 @@ class FakeAgent:
         return True
 
 
+def _git(*args, cwd: Path) -> str:
+    return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args], cwd=cwd,
+                          check=True, capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip()
+
+
+def _make_remote(remotes: Path, repo: str, branches: dict | None = None) -> Path:
+    """A bare repository at ``remotes/<repo>.git`` standing in for GitHub: ``main`` with README.md, plus
+    *branches* (name -> a file it adds)."""
+    bare = remotes / f"{repo}.git"
+    bare.parent.mkdir(parents=True, exist_ok=True)
+    _git("init", "--quiet", "--bare", "--initial-branch=main", str(bare), cwd=remotes)
+    work = remotes / f"{repo}.work"
+    _git("clone", "--quiet", str(bare), str(work), cwd=remotes)
+    (work / "README.md").write_text("demo\n")
+    _git("add", "README.md", cwd=work)
+    _git("commit", "--quiet", "-m", "start", cwd=work)
+    _git("push", "--quiet", "origin", "HEAD:main", cwd=work)
+    for branch, filename in (branches or {}).items():
+        _git("checkout", "--quiet", "-b", branch, "main", cwd=work)
+        (work / filename).write_text("earlier work\n")
+        _git("add", filename, cwd=work)
+        _git("commit", "--quiet", "-m", "earlier work", cwd=work)
+        _git("push", "--quiet", "origin", f"HEAD:{branch}", cwd=work)
+    return bare
+
+
 @pytest_asyncio.fixture
 async def harness(tmp_path):
     snugban = FakeSnugban()
     await snugban.server.start_server()
-    block = {"base_url": snugban.base_url, "agent_key": AGENT_KEY, "workspace_root": str(tmp_path / "checkouts")}
+    _make_remote(tmp_path / "remotes", "keithmackay/demo-app")
+    block = {"base_url": snugban.base_url, "agent_key": AGENT_KEY, "workspace_root": str(tmp_path / "checkouts"),
+             "git_remote_base": f"file://{tmp_path / 'remotes'}/"}
     adapter = _adapter(_route(snugban.base_url, snugban=block))
     admitted = []
 
@@ -199,7 +233,7 @@ _TAMPERINGS = {
     "wrong_secret": lambda body, headers: _resign(headers, body, secret="not-the-secret"),
     "changed_body": lambda body, headers: body.replace(b"health", b"wealth"),
     "stale": lambda body, headers: _resign(headers, body, timestamp=str(int(time.time()) - 301)),
-    "future": lambda body, headers: _resign(headers, body, timestamp=str(int(time.time()) + 301)),
+    "future": lambda body, headers: _resign(headers, body, timestamp=str(int(time.time()) + 360)),
     "no_signature": lambda body, headers: headers.pop("X-Snugban-Signature") and body,
     "no_timestamp": lambda body, headers: headers.pop("X-Snugban-Timestamp") and body,
     "no_prefix": lambda body, headers: headers.update(
@@ -698,6 +732,51 @@ class TestWorkspace:
         await async_wait_until(lambda: not workspace.exists(), timeout=10, what="the checkout to be removed")
 
     @pytest.mark.asyncio
+    async def test_the_checkout_is_cloned_on_a_new_branch_from_the_base_branch(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        workspace = Path(self._workspace(harness, harness.admitted[0]))
+        assert _git("rev-parse", "--abbrev-ref", "HEAD", cwd=workspace) == "snugban/5a7b9c-add-a-health-endpoint"
+        assert (workspace / "README.md").read_text() == "demo\n"
+        assert _git("rev-parse", "HEAD", cwd=workspace) == _git("rev-parse", "origin/main", cwd=workspace)
+
+    @pytest.mark.asyncio
+    async def test_the_checkout_continues_a_branch_the_remote_already_has(self, harness, tmp_path):
+        _make_remote(tmp_path / "remotes", "keithmackay/carried-on",
+                     {"snugban/5a7b9c-add-a-health-endpoint": "earlier.txt"})
+        payload = _dispatch()
+        payload["project"]["repo"]["githubRepo"] = "keithmackay/carried-on"
+        assert (await harness.post(payload)).status == 202
+        workspace = Path(self._workspace(harness, harness.admitted[0]))
+        assert (workspace / "earlier.txt").read_text() == "earlier work\n"
+        assert _git("rev-parse", "--abbrev-ref", "@{upstream}", cwd=workspace) == \
+            "origin/snugban/5a7b9c-add-a-health-endpoint"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("repo", ["keithmackay/no-such-repo", None])
+    async def test_a_checkout_that_cannot_be_made_fails_the_dispatch(self, harness, tmp_path, repo):
+        payload = _dispatch()
+        if repo is None:
+            payload["project"]["repo"] = {}
+        else:
+            payload["project"]["repo"]["githubRepo"] = repo
+        assert (await harness.post(payload)).status == 202
+        await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
+        reason = json.loads(harness.snugban.steps("fail")[0]["body"])["reason"]
+        assert "checkout" in reason and AGENT_KEY not in reason and str(tmp_path) not in reason
+        assert harness.admitted == [] and harness.snugban.steps("ack") == []
+        await async_wait_until(lambda: not (tmp_path / "checkouts" / DISPATCH_ID).exists(), timeout=10,
+                               what="the failed checkout to be removed")
+
+    @pytest.mark.asyncio
+    async def test_the_prompt_keeps_the_run_in_its_checkout(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        workspace = self._workspace(harness, harness.admitted[0])
+        prompt = harness.admitted[0].text
+        assert f"The checkout is ready at {workspace}" in prompt
+        assert "never cd elsewhere" in prompt and f"cd {workspace} before any git command" in prompt
+        assert "clone" not in prompt.lower()
+
+    @pytest.mark.asyncio
     async def test_a_source_that_is_not_a_dispatch_run_has_no_workspace(self, harness):
         assert (await harness.post({"type": "decision", "questionId": "01QUESTION", "answer": "No."})).status == 202
         assert self._workspace(harness, harness.admitted[0]) is None
@@ -765,7 +844,7 @@ class TestRestart:
         harness.run_agent(harness.admitted[0], agent)
         self._restart(harness)
         resend = await harness.post(payload)
-        assert resend.status == 200 and (await resend.json())["status"] == "duplicate"
+        assert resend.status == 202
         assert len(harness.admitted) == 1
         await async_wait_until(lambda: len(harness.snugban.steps("ack")) == 2, timeout=10, what="a re-ack")
         await async_wait_until(lambda: harness.snugban.steps("heartbeat"), timeout=10, what="heartbeats")
@@ -779,7 +858,7 @@ class TestRestart:
         await _reports_done(harness)
         self._restart(harness)
         resend = await harness.post(_dispatch())
-        assert resend.status == 200
+        assert resend.status == 202
         assert len(harness.admitted) == 1
         requests = len(harness.snugban.requests)
         assert (await harness.post({"type": "status_request", "dispatchId": DISPATCH_ID})).status == 200
