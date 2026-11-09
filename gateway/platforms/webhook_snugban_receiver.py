@@ -463,9 +463,9 @@ class SnugbanReceiver:
         dispatch = self._dispatches.get(dispatch_id)
         if dispatch is None:
             # Unknown here (never sent, or taken before a restart): stop any session it has, and refuse it later.
-            dispatch = self._dispatches[dispatch_id] = _Dispatch(dispatch_id, None)
-            self._finish(dispatch, "aborted")
+            dispatch = self._dispatches[dispatch_id] = _Dispatch(dispatch_id, None, state="aborted")
             await self._stop_unknown(dispatch_id, "snugban_abort")
+            self._finish(dispatch, "aborted")
         else:
             self._finish(dispatch, "aborted")
             if dispatch.run is not None and not dispatch.run.ended.is_set():
