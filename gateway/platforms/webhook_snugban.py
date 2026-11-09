@@ -8,12 +8,14 @@ reaches the live run of its task (else starts one) and ``status_request`` answer
 Snugban resends a dispatch and a decision with new delivery ids, so each ``dispatchId`` and
 ``questionId`` is acted on once. Protocol: Snugban's ``docs/agent-protocol.md``."""
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
 
@@ -38,6 +40,8 @@ _BRANCH_RE = re.compile(r"(?!-)(?!.*\.\.)(?!.*//)[A-Za-z0-9._/-]{1,200}(?<![/.])
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9-]{1,100}/[A-Za-z0-9._-]{1,100}")
 _MAX_TIMESTAMP_DIGITS = 15
 _UNSET_REF_RE = re.compile(r"\$\{[^}]*\}")
+_DELIVERY_RE = re.compile(r"snugban:(?:dispatch|resume|answer):([A-Za-z0-9_-]{1,100})(?::.*)?")
+_CHAT_TOKEN_RE = re.compile(r"webhook:v2:([A-Za-z0-9_-]+)")
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 
 
@@ -70,10 +74,45 @@ def snugban_route_problem(route_config: dict, secret: Any) -> Optional[str]:
     parsed = urlparse(base_url) if isinstance(base_url, str) else None
     if parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc:
         return "snugban.base_url must be Snugban's http(s) URL, e.g. http://<snugban-host>.<tailnet>.ts.net:7420"
+    root = block.get("workspace_root")
+    if root is not None and (not _is_set(root) or not Path(root).expanduser().is_absolute()):
+        return "snugban.workspace_root must be an absolute directory (each dispatch gets a checkout under it)"
     if not _is_set(block.get("agent_key")):
         return ("snugban.agent_key is missing, blank or an unset ${...} reference; set it to the agent key "
                 "Snugban issued (e.g. agent_key: \"${SNUGBAN_AGENT_KEY}\" with the variable in .env)")
     return None
+
+
+def dispatch_of_delivery(delivery_id: str) -> Optional[str]:
+    """The dispatch a Snugban run's delivery id names (``snugban:dispatch:<id>``, ``snugban:resume:<id>:...``)."""
+    match = _DELIVERY_RE.fullmatch(delivery_id or "")
+    return match.group(1) if match else None
+
+
+def webhook_delivery_of(text: str) -> Optional[tuple]:
+    """``(profile, route, delivery_id)`` of the webhook chat id in *text* (a chat id or a session key): its
+    ``webhook:v2:`` token is that triple as base64 JSON."""
+    match = _CHAT_TOKEN_RE.search(text or "")
+    if match is None:
+        return None
+    token = match.group(1)
+    try:
+        profile, route, delivery_id = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+    except (ValueError, TypeError):
+        return None
+    return str(profile), str(route), str(delivery_id)
+
+
+def dispatch_workspace(route_config: dict, route_name: str, dispatch_id: str) -> Path:
+    """The directory a dispatch works in: ``snugban.workspace_root`` (default: ``snugban-checkouts/<route>``
+    in the Hermes home) / its dispatch id."""
+    root = snugban_block(route_config).get("workspace_root")
+    if root:
+        base = Path(root).expanduser()
+    else:
+        from hermes_constants import get_hermes_home
+        base = get_hermes_home() / "snugban-checkouts" / route_name
+    return base / dispatch_id
 
 
 def snugban_signature_valid(headers, body: bytes, secret: str, now: Optional[float] = None) -> bool:
@@ -145,7 +184,7 @@ ANSWERED_INTRO = ("The earlier run of this dispatch ended waiting for Keith's an
                   "on the branch as you find it, checking its state (git status, git log) first.")
 
 
-def _dispatch_prompt(payload: dict, *, intro: Optional[str] = None, decisions: tuple = ()) -> str:
+def _dispatch_prompt(payload: dict, workspace: Path, *, intro: Optional[str] = None, decisions: tuple = ()) -> str:
     dispatch_id, branch = payload["dispatchId"], payload["branch"]
     project = payload["project"]
     repo = (project.get("repo") or {}).get("githubRepo") if isinstance(project.get("repo"), dict) else None
@@ -155,7 +194,11 @@ def _dispatch_prompt(payload: dict, *, intro: Optional[str] = None, decisions: t
     lines += [
         "", f"Dispatch id: {dispatch_id}", f"Branch: {branch}",
         f"Repository: {repo or '(none given)'}; base branch: {project.get('defaultBranch') or '(not given)'}",
+        f"Working directory: {workspace} (this dispatch's own checkout; your terminal starts there)",
         "", "How to work it:",
+        f"0. Keep all work for this dispatch in {workspace}. If it is empty, clone the repository into it "
+        f"(for example `gh repo clone {repo or '<owner>/<name>'} .`); if it holds a checkout, continue in it. "
+        "Never work on this branch in any other directory.",
         f"1. The receiver has already acknowledged the dispatch. If unsure, call "
         f"mcp__snugban__acknowledge_dispatch with dispatchId {dispatch_id}; doing it again changes nothing.",
         f"2. Work on branch {branch}: continue it if it exists, otherwise create it from the base branch.",

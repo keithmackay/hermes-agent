@@ -5,10 +5,10 @@ steer them. Runs are gateway webhook sessions; their delivery ids name the dispa
 sessions can be found and stopped from the session keys alone after a gateway restart."""
 
 import asyncio
-import base64
 import json
 import logging
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -16,7 +16,8 @@ from typing import Any, Optional
 from gateway.platforms.webhook_snugban import (
     _ACTED_ON_TTL_SECONDS, _DEFAULT_HEARTBEAT_SECONDS, _DELIVERY_HEADER, _DELIVERY_TTL_SECONDS, _ID_RE,
     _MAX_REMEMBERED, _SIGNATURE_HEADER, ANSWERED_INTRO, RESUMED_INTRO, SnugbanClient, _decision_prompt,
-    _decision_text, _dispatch_prompt, _Invalid, _json, _require_dispatch_shape, _valid_id, snugban_block)
+    _decision_text, _dispatch_prompt, _Invalid, _json, _require_dispatch_shape, _valid_id, dispatch_of_delivery,
+    dispatch_workspace, snugban_block, webhook_delivery_of)
 
 logger = logging.getLogger(__name__)
 
@@ -27,30 +28,13 @@ _STOP_ENFORCE_LIMIT_SECONDS = 3600.0
 # A session found running for a dispatch this receiver no longer knows (a gateway restart) has no
 # settlement to wait for: it is stopped again whenever found running, for this long.
 _ORPHAN_ENFORCE_SECONDS = 300.0
+# How long a webhook waits for a stopped run to end before another run may start on its branch; under the
+# 10 s Snugban gives a webhook, so a run slower to stop gets a 503 and Snugban's retry.
+_SETTLE_WAIT_SECONDS = 8.0
 _LIVE_ADMISSION = frozenset({"queued", "started"})
 # Dispatch states in which the receiver heartbeats it: a run works it, or it waits for Keith's answer.
 _HEARTBEATING = frozenset({"running", "waiting_answer"})
-_DELIVERY_RE = re.compile(r"snugban:(?:dispatch|resume|answer):([A-Za-z0-9_-]{1,100})(?::.*)?")
-_CHAT_TOKEN_RE = re.compile(r"webhook:v2:([A-Za-z0-9_-]+)")
 _QUESTION_ID_RE = re.compile(r'"questionId"\s*:\s*"([A-Za-z0-9_-]{1,100})"')
-
-
-def _dispatch_of_delivery(delivery_id: str) -> Optional[str]:
-    match = _DELIVERY_RE.fullmatch(delivery_id or "")
-    return match.group(1) if match else None
-
-
-def _delivery_of_session_key(session_key: str) -> Optional[tuple]:
-    """``(profile, route, delivery_id)`` of a webhook session key (its chat id is a ``webhook:v2:`` token)."""
-    match = _CHAT_TOKEN_RE.search(session_key)
-    if match is None:
-        return None
-    token = match.group(1)
-    try:
-        profile, route, delivery_id = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
-    except (ValueError, TypeError):
-        return None
-    return str(profile), str(route), str(delivery_id)
 
 
 def _tool_calls(raw: Any) -> list:
@@ -85,8 +69,9 @@ def _admitted(payload: dict) -> dict:
 class _Run:
     """One agent run of a dispatch, followed through its admission (``WebhookAdapter._admit_agent_run``)."""
 
-    def __init__(self, delivery_id: str, on_end=None):
+    def __init__(self, delivery_id: str, on_end=None, on_admitted=None):
         self.delivery_id = delivery_id
+        self._on_admitted = on_admitted
         self.session_id: Optional[str] = None
         self.db = None
         self.status: Optional[str] = None  # its admission's status: when committed, then when it ended
@@ -96,6 +81,8 @@ class _Run:
 
     def admitted(self, session_id: str, db, status: Optional[str] = None) -> None:
         self.session_id, self.db, self.status = session_id, db, status
+        if self._on_admitted is not None:
+            self._on_admitted(self)
 
     def settled(self, status: Optional[str]) -> None:
         if self.ended.is_set():
@@ -110,7 +97,7 @@ class _Run:
 class _Dispatch:
     id: str
     payload: Optional[dict]  # None for an abort of a dispatch never received here
-    state: str = "running"  # running | waiting_answer | paused | aborted | ended
+    state: str = "running"  # running | waiting_answer | paused | aborted | replaced | ended
     run: Optional[_Run] = None
     pending_decisions: list = field(default_factory=list)
     open_questions: set = field(default_factory=set)
@@ -159,9 +146,22 @@ class SnugbanReceiver:
         self._spawn(self._client().report(dispatch_id, step, body), f"snugban-report-{step}-{dispatch_id}")
 
     def _finish(self, dispatch: _Dispatch, state: str) -> None:
-        """The dispatch is over here: nothing heartbeats it any more."""
+        """The dispatch is over here: nothing heartbeats it any more, and its checkout goes once no run works in
+        it (a run still stopping removes it when it ends, through ``_after_run``)."""
         dispatch.state, dispatch.ended_at = state, time.time()
         self._stop_heartbeat(dispatch)
+        if dispatch.run is None or dispatch.run.ended.is_set():
+            self._remove_workspace(dispatch.id)
+
+    def _workspace(self, dispatch_id: str):
+        with self._adapter._profile_scope(self._profile):
+            return dispatch_workspace(self._route_config(), self._route_name, dispatch_id)
+
+    def _remove_workspace(self, dispatch_id: str) -> None:
+        workspace = self._workspace(dispatch_id)
+        if workspace.exists():
+            logger.info("[webhook] Removing the checkout of Snugban dispatch %s", dispatch_id)
+            self._spawn(asyncio.to_thread(shutil.rmtree, workspace, True), f"snugban-cleanup-{dispatch_id}")
 
     # --- entry point ---
 
@@ -229,7 +229,8 @@ class SnugbanReceiver:
         its run is still live (it is adopted); ``"ended"`` when that earlier run is over; None when admission
         failed. The run is the dispatch's before admission, so a pause or abort arriving meanwhile stops it."""
         run = _Run(delivery_id, on_end=lambda ended: self._spawn(
-            self._after_run(dispatch, ended), f"snugban-ended-{dispatch.id}"))
+            self._after_run(dispatch, ended), f"snugban-ended-{dispatch.id}"),
+            on_admitted=lambda admitted: self._bind_workspace(dispatch, admitted))
         previous = (dispatch.run, dispatch.state)
         dispatch.run, dispatch.state = run, "running"
         outcome = await self._admit(prompt, dispatch.payload, delivery_id, "dispatch", watch=run)
@@ -241,14 +242,26 @@ class SnugbanReceiver:
             self._start_heartbeat(dispatch)
         return outcome
 
+    def _bind_workspace(self, dispatch: _Dispatch, run: _Run) -> None:
+        """Make the dispatch's checkout the run's working directory. Called as the run is committed, before it
+        can execute: its terminal and file tools resolve their cwd from the overrides of its task id, which
+        is its session id."""
+        from tools.terminal_tool import register_task_env_overrides, resolve_task_overrides
+        if run.session_id:
+            register_task_env_overrides(run.session_id, {**resolve_task_overrides(run.session_id),
+                                                         "cwd": str(self._workspace(dispatch.id))})
+
     async def _after_run(self, dispatch: _Dispatch, run: _Run) -> None:
         """A run of *dispatch* ended: keep the dispatch while it waits for Keith, else fail it if the run left
         it open. An outcome that is not known (the run crashed, its finalization failed) fails nothing."""
+        if run.session_id:
+            from tools.terminal_tool import clear_task_env_overrides
+            clear_task_env_overrides(run.session_id)
         if dispatch.run is not run:
             return
         if run.stopped or dispatch.state != "running":
-            if dispatch.state == "aborted":
-                self._finish(dispatch, "aborted")
+            if dispatch.state in ("aborted", "replaced"):
+                self._finish(dispatch, dispatch.state)
             return
         if run.status != "terminal":
             logger.warning("[webhook] Snugban dispatch %s: its run ended with outcome %r; leaving the dispatch to "
@@ -274,7 +287,7 @@ class SnugbanReceiver:
     async def _run_again(self, dispatch: _Dispatch, intro: str, delivery_id: str) -> Optional[str]:
         """Start a new run of *dispatch* on its branch, carrying the answers held for it."""
         decisions, dispatch.pending_decisions = tuple(dispatch.pending_decisions), []
-        prompt = _dispatch_prompt(dispatch.payload, intro=intro, decisions=decisions)
+        prompt = _dispatch_prompt(dispatch.payload, self._workspace(dispatch.id), intro=intro, decisions=decisions)
         outcome = await self._start_run(dispatch, prompt, delivery_id)
         if outcome is None:
             dispatch.pending_decisions[:0] = decisions
@@ -286,20 +299,36 @@ class SnugbanReceiver:
         run.stopped = True
         await self._stop_delivery(run.delivery_id, reason, until=run.ended, limit=_STOP_ENFORCE_LIMIT_SECONDS)
 
+    def _session_id_of(self, delivery_id: str) -> Optional[str]:
+        """The session the delivery was admitted to (its admission's request id is the delivery id)."""
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self._runner())
+        rows = authority.db._read_all("SELECT target_session_id FROM session_admissions WHERE request_id=?",
+                                      (delivery_id,)) if authority is not None else []
+        return rows[0]["target_session_id"] if len(rows) == 1 else None
+
     async def _stop_delivery(self, delivery_id: str, reason: str, *, until: Optional[asyncio.Event],
                              limit: float) -> None:
-        """Interrupt the session of *delivery_id* as ``/stop`` does, now and whenever it is found running
-        until *until* is set (its run settled) or *limit* seconds pass."""
+        """Interrupt the session of *delivery_id* as ``/stop`` does and kill every process it started (a
+        background ``git push`` included), now and whenever it is found running until *until* is set (its
+        run settled) or *limit* seconds pass."""
         from gateway.run import _INTERRUPT_REASON_STOP
+        from tools.process_registry import process_registry
         key, source = self._session(delivery_id)
         runner = self._runner()
+        session_id = self._session_id_of(delivery_id)
 
         async def _interrupt() -> None:
-            await runner._interrupt_and_clear_session(key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
-                                                      invalidation_reason=reason)
+            if runner._is_session_running(key):
+                await runner._interrupt_and_clear_session(key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+                                                          invalidation_reason=reason)
+            if session_id:
+                killed = await asyncio.to_thread(process_registry.kill_all, session_id, source=reason,
+                                                 consume_output=True)
+                if killed:
+                    logger.info("[webhook] Killed %d process(es) of Snugban run %s", killed, delivery_id)
 
-        if runner._is_session_running(key):
-            await _interrupt()
+        await _interrupt()
 
         async def _enforce() -> None:
             deadline = time.monotonic() + limit
@@ -308,6 +337,8 @@ class SnugbanReceiver:
                 if not (until is not None and until.is_set()) and runner._is_session_running(key):
                     logger.info("[webhook] Snugban run %s is running after it was stopped; stopping it", delivery_id)
                     await _interrupt()
+            if until is not None and until.is_set():
+                await _interrupt()  # a process the run started as it was stopping
 
         self._spawn(_enforce(), f"snugban-stop-{delivery_id}")
 
@@ -316,8 +347,8 @@ class SnugbanReceiver:
         deliveries = {f"snugban:dispatch:{dispatch_id}"}
         profile = self._profile or "default"
         for key in self._runner()._snapshot_running_agents():
-            found = _delivery_of_session_key(key)
-            if found and found[:2] == (profile, self._route_name) and _dispatch_of_delivery(found[2]) == dispatch_id:
+            found = webhook_delivery_of(key)
+            if found and found[:2] == (profile, self._route_name) and dispatch_of_delivery(found[2]) == dispatch_id:
                 deliveries.add(found[2])
         return deliveries
 
@@ -378,14 +409,20 @@ class SnugbanReceiver:
             if known.state in _HEARTBEATING:
                 self._report(dispatch_id, "ack")  # the resend means Snugban missed the first ack
             return _json({"status": "duplicate", "dispatchId": dispatch_id})
+        if not await self._replace_runs_of_task(payload["task"]["id"]):
+            return _json({"error": "An earlier run of this task is still stopping; retry this delivery"}, 503)
         dispatch = self._dispatches[dispatch_id] = _Dispatch(dispatch_id, payload)
-        outcome = await self._start_run(dispatch, _dispatch_prompt(payload), f"snugban:dispatch:{dispatch_id}")
+        workspace = self._workspace(dispatch_id)
+        await asyncio.to_thread(workspace.mkdir, 0o700, True, True)
+        outcome = await self._start_run(dispatch, _dispatch_prompt(payload, workspace),
+                                        f"snugban:dispatch:{dispatch_id}")
         if outcome is None:
             self._dispatches.pop(dispatch_id, None)  # not admitted: Snugban's resend must be taken
             return _json({"error": "Admission unavailable; retry this delivery"}, 503)
         if outcome == "ended":
             # Taken before a restart and its run is over: nothing works it here, so it is not held.
             self._dispatches.pop(dispatch_id, None)
+            self._remove_workspace(dispatch_id)
             logger.info("[webhook] Snugban dispatch %s was run here before and that run has ended", dispatch_id)
             return _json({"status": "duplicate", "dispatchId": dispatch_id})
         self._report(dispatch_id, "ack")
@@ -394,6 +431,32 @@ class SnugbanReceiver:
             return _json({"status": "duplicate", "dispatchId": dispatch_id})
         logger.info("[webhook] Snugban dispatch %s accepted on route %s", dispatch_id, self._route_name)
         return _json({"status": "accepted", "dispatchId": dispatch_id}, 202)
+
+    async def _replace_runs_of_task(self, task_id: Any) -> bool:
+        """A new dispatch of a task replaces any earlier one held here (Snugban sends work back as a new
+        dispatch): stop its run and wait for it to end, so two runs never work one branch. False when a run
+        is still stopping after ``_SETTLE_WAIT_SECONDS``."""
+        same_task = [d for d in self._dispatches.values()
+                     if d.payload is not None and d.payload["task"].get("id") == task_id]
+        for dispatch in same_task:
+            if dispatch.state in ("running", "waiting_answer", "paused"):
+                logger.info("[webhook] Snugban dispatch %s is replaced by a new dispatch of its task", dispatch.id)
+                self._finish(dispatch, "replaced")
+                if dispatch.run is not None and not dispatch.run.ended.is_set():
+                    await self._stop_run(dispatch.run, "snugban_replaced")
+        return await self._runs_ended([d.run for d in same_task if d.run is not None])
+
+    @staticmethod
+    async def _runs_ended(runs: list) -> bool:
+        """Wait (up to ``_SETTLE_WAIT_SECONDS``) for *runs* to end; whether they all did."""
+        waiting = [run.ended.wait() for run in runs if not run.ended.is_set()]
+        if not waiting:
+            return True
+        try:
+            await asyncio.wait_for(asyncio.gather(*waiting), _SETTLE_WAIT_SECONDS)
+        except TimeoutError:
+            return False
+        return True
 
     async def _on_abort(self, payload: dict, delivery_id: str):
         dispatch_id = _valid_id(payload, "dispatchId")
@@ -428,6 +491,8 @@ class SnugbanReceiver:
         dispatch = self._dispatches.get(dispatch_id)
         if dispatch is None or dispatch.state != "paused" or dispatch.payload is None:
             return _json({"error": f"Dispatch {dispatch_id} is not paused here"}, 404)
+        if not await self._runs_ended([dispatch.run] if dispatch.run is not None else []):
+            return _json({"error": "The paused run is still stopping; retry this delivery"}, 503)
         outcome = await self._run_again(dispatch, RESUMED_INTRO, f"snugban:resume:{dispatch_id}:{delivery_id}")
         if outcome != "accepted":
             return _json({"error": "Admission unavailable; retry this delivery"}, 503)

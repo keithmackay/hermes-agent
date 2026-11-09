@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -167,10 +168,11 @@ class FakeAgent:
 
 
 @pytest_asyncio.fixture
-async def harness():
+async def harness(tmp_path):
     snugban = FakeSnugban()
     await snugban.server.start_server()
-    adapter = _adapter(_route(snugban.base_url))
+    block = {"base_url": snugban.base_url, "agent_key": AGENT_KEY, "workspace_root": str(tmp_path / "checkouts")}
+    adapter = _adapter(_route(snugban.base_url, snugban=block))
     admitted = []
 
     async def _observe(event):
@@ -334,6 +336,7 @@ class TestRouteConfig:
         {"base_url": "http://snugban.example.ts.net:7420"},
         {"base_url": "snugban.example.ts.net:7420", "agent_key": AGENT_KEY},
         {"base_url": "ftp://snugban.example.ts.net", "agent_key": AGENT_KEY},
+        {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY, "workspace_root": "relative/dir"},
         {"agent_key": AGENT_KEY},
         "not a mapping",
     ])
@@ -623,6 +626,107 @@ class TestRunSettlement:
         await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
 
 
+class TestWorkspace:
+    """Each dispatch works in a checkout of its own, kept across pause and resume, removed when it ends."""
+
+    @staticmethod
+    def _workspace(harness, event):
+        """The working directory the run's terminal and file tools resolve (keyed by its session id)."""
+        from tools.terminal_tool import resolve_task_overrides
+        return resolve_task_overrides(_session_id(harness, event)).get("cwd")
+
+    @pytest.mark.asyncio
+    async def test_each_dispatch_gets_its_own_directory_named_in_its_prompt(self, harness, tmp_path):
+        assert (await harness.post(_dispatch())).status == 202
+        other = _dispatch("01OTHERDISPATCH0000000000")
+        other["task"] = {**other["task"], "id": "01OTHERTASK"}
+        assert (await harness.post(other)).status == 202
+        first, second = (self._workspace(harness, event) for event in harness.admitted)
+        assert first == str(tmp_path / "checkouts" / DISPATCH_ID)
+        assert second == str(tmp_path / "checkouts" / "01OTHERDISPATCH0000000000")
+        assert Path(first).is_dir() and Path(second).is_dir()
+        assert first in harness.admitted[0].text and second not in harness.admitted[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_run_works_in_the_paused_runs_directory(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        workspace = Path(self._workspace(harness, harness.admitted[0]))
+        (workspace / "work-in-progress.txt").write_text("uncommitted")
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
+        await _end_run(harness, harness.admitted[0])
+        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
+        assert self._workspace(harness, harness.admitted[1]) == str(workspace)
+        assert (workspace / "work-in-progress.txt").read_text() == "uncommitted"
+
+    @pytest.mark.asyncio
+    async def test_the_directory_is_removed_when_the_dispatch_ends(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        workspace = Path(self._workspace(harness, harness.admitted[0]))
+        await _end_run(harness, harness.admitted[0])
+        await async_wait_until(lambda: not workspace.exists(), timeout=10, what="the checkout to be removed")
+
+    @pytest.mark.asyncio
+    async def test_an_aborted_dispatch_keeps_its_directory_until_its_run_stops(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        workspace = Path(self._workspace(harness, harness.admitted[0]))
+        harness.run_agent(harness.admitted[0], FakeAgent())
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        assert workspace.is_dir()
+        await _end_run(harness, harness.admitted[0])
+        await async_wait_until(lambda: not workspace.exists(), timeout=10, what="the checkout to be removed")
+
+    @pytest.mark.asyncio
+    async def test_a_source_that_is_not_a_dispatch_run_has_no_workspace(self, harness):
+        assert (await harness.post({"type": "decision", "questionId": "01QUESTION", "answer": "No."})).status == 202
+        assert self._workspace(harness, harness.admitted[0]) is None
+
+
+class TestReplacingRuns:
+    """No two runs work one branch: a stopped run must end before another starts on its branch."""
+
+    @pytest.mark.asyncio
+    async def test_resume_waits_for_the_paused_run_to_end(self, harness, monkeypatch):
+        import gateway.platforms.webhook_snugban_receiver as receiver_module
+        monkeypatch.setattr(receiver_module, "_SETTLE_WAIT_SECONDS", 0.2)
+        assert (await harness.post(_dispatch())).status == 202
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
+        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 503
+        assert len(harness.admitted) == 1
+        await _end_run(harness, harness.admitted[0])
+        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
+
+    @pytest.mark.asyncio
+    async def test_a_new_dispatch_of_the_same_task_replaces_the_old_one(self, harness, monkeypatch):
+        import gateway.platforms.webhook_snugban_receiver as receiver_module
+        monkeypatch.setattr(receiver_module, "_SETTLE_WAIT_SECONDS", 0.2)
+        assert (await harness.post(_dispatch())).status == 202
+        old_workspace = Path(TestWorkspace._workspace(harness, harness.admitted[0]))
+        agent = FakeAgent()
+        harness.run_agent(harness.admitted[0], agent)
+        revision = _dispatch("01REVISION0000000000000000", revision={"changes": "Fix the test."})
+        assert (await harness.post(revision)).status == 503
+        assert agent.interrupts and len(harness.admitted) == 1
+        await _end_run(harness, harness.admitted[0])
+        assert (await harness.post(revision)).status == 202
+        assert len(harness.admitted) == 2
+        await async_wait_until(lambda: not old_workspace.exists(), timeout=10, what="the old checkout removed")
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == []
+
+    @pytest.mark.asyncio
+    async def test_stopping_a_run_kills_its_background_processes(self, harness):
+        from tools.process_registry import process_registry
+        assert (await harness.post(_dispatch())).status == 202
+        session_id = _session_id(harness, harness.admitted[0])
+        process_registry.spawn_local("sleep 60", task_id=session_id, owner_task_id=session_id)
+        try:
+            assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+            await async_wait_until(lambda: not process_registry.running_owned_by(session_id), timeout=10,
+                                   what="the run's background process to be killed")
+        finally:
+            process_registry.kill_all(session_id, source="test_cleanup")
+
+
 class TestRestart:
     """The receiver forgets everything on a gateway restart; durable admission does not."""
 
@@ -825,6 +929,7 @@ class TestDecision:
                                    "answer": "Use port 8080."})
         assert resp.status == 200
         assert len(harness.admitted) == 1
+        await _end_run(harness, harness.admitted[0])
         assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
         assert "Use port 8080." in harness.admitted[1].text
 
