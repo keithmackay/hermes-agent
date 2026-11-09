@@ -15,11 +15,11 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from gateway.platforms.webhook_snugban import (
-    _ACTED_ON_TTL_SECONDS, _DEFAULT_HEARTBEAT_SECONDS, _DELIVERY_HEADER, _DELIVERY_TTL_SECONDS, _ID_RE,
+    _ACTED_ON_TTL_SECONDS, _BRANCH_RE, _DEFAULT_HEARTBEAT_SECONDS, _DELIVERY_HEADER, _DELIVERY_TTL_SECONDS, _ID_RE,
     _MAX_REMEMBERED, _SIGNATURE_HEADER, ANSWERED_INTRO, RESUMED_INTRO, SnugbanClient, _decision_prompt,
     _decision_text, _dispatch_prompt, _Invalid, _json, _require_dispatch_shape, _valid_id, dispatch_of_delivery,
     dispatch_workspace, remote_url, snugban_block, webhook_delivery_of)
-from gateway.platforms.webhook_snugban_checkout import CheckoutError, git_env, prepare_checkout, remove_scratch
+from gateway.platforms.webhook_snugban_checkout import CheckoutError, prepare_checkout, remove_scratch
 
 logger = logging.getLogger(__name__)
 
@@ -72,17 +72,23 @@ def _admitted(payload: dict) -> dict:
     return {key: value for key, value in payload.items() if key != "deliveryId"}
 
 
-def snugban_routes_connected(adapter) -> None:
+def snugban_routes_connected(adapter, *, is_reconnect: bool = False) -> None:
     """Startup work for the Snugban routes of a connecting webhook adapter: rebind runs to their checkouts,
-    and delete scratch folders a stopped process left. Neither may keep the platform from connecting."""
+    and (on a first connect only: a reconnect happens while clones may be running) delete scratch folders a
+    stopped process left. Neither may keep the platform from connecting."""
     try:
         if bound := rebind_workspaces(adapter):
             logger.info("[webhook] Rebound %d Snugban dispatch run(s) to their checkouts", bound)
     except Exception:
         logger.exception("[webhook] Could not rebind Snugban dispatch runs to their checkouts")
+    if is_reconnect:
+        return
     for route_name, route_config in adapter._routes.items():
         if isinstance(snugban_block(route_config), dict):
-            root = dispatch_workspace(route_config, route_name, "_").parent
+            # A route bound to a profile keeps its checkouts in that profile's home.
+            profile = route_config.get("profile")
+            with adapter._profile_scope(profile if isinstance(profile, str) and profile != "default" else None):
+                root = dispatch_workspace(route_config, route_name, "_").parent
             task = asyncio.create_task(asyncio.to_thread(remove_scratch, root), name=f"snugban-scratch-{route_name}")
             adapter._background_tasks.add(task)
             task.add_done_callback(adapter._background_tasks.discard)
@@ -389,6 +395,10 @@ class SnugbanReceiver:
                     receipt = await authority.cancel_queued(
                         actor, SessionRef(authority.profile_id, row["target_session_id"]), row["admission_id"])
                 except RuntimeStoreError:
+                    return False  # claimed first (stale_generation): the caller stops the started run
+                except Exception:
+                    logger.exception("[webhook] Could not withdraw the queued Snugban run %s; stopping it instead",
+                                     delivery_id)
                     return False
                 if receipt.outcome == "cancelled":
                     logger.info("[webhook] Withdrew the queued Snugban run %s", delivery_id)
@@ -527,7 +537,7 @@ class SnugbanReceiver:
         leaves it unacknowledged, so Snugban's resend is taken again."""
         payload, workspace = dispatch.payload, self._workspace(dispatch.id)
         try:
-            await self._prepare(dispatch, workspace)
+            note = await self._prepare(dispatch, workspace)
         except Exception as exc:
             if isinstance(exc, CheckoutError):
                 reason = str(exc)
@@ -543,8 +553,12 @@ class SnugbanReceiver:
         if dispatch.state != "preparing":  # aborted or replaced while it was being checked out
             self._finish(dispatch, dispatch.state)
             return
-        outcome = await self._start_run(dispatch, _dispatch_prompt(payload, workspace),
-                                        f"snugban:dispatch:{dispatch.id}")
+        delivery_id = f"snugban:dispatch:{dispatch.id}"
+        # A run admitted before (a resend after a restart) keeps the prompt it was admitted with: a different one
+        # would not be the same delivery to durable admission.
+        if note and self._session_id_of(delivery_id):
+            note = None
+        outcome = await self._start_run(dispatch, _dispatch_prompt(payload, workspace, intro=note), delivery_id)
         if outcome is None:
             self._dispatches.pop(dispatch.id, None)  # not admitted: Snugban's resend must be taken
             return
@@ -558,19 +572,28 @@ class SnugbanReceiver:
         logger.info("[webhook] Snugban dispatch %s %s on route %s", dispatch.id,
                     "adopted from before a restart" if outcome == "duplicate" else "accepted", self._route_name)
 
-    async def _prepare(self, dispatch: _Dispatch, workspace) -> None:
+    async def _prepare(self, dispatch: _Dispatch, workspace) -> Optional[str]:
+        """Make or find the dispatch's checkout; a note for the run's prompt when a reused checkout is not on the
+        dispatch's branch, else None."""
         repo = (dispatch.payload["project"].get("repo") or {}).get("githubRepo")
         if not repo:
             raise CheckoutError("the project has no GitHub repository to check out")
         with self._adapter._profile_scope(self._profile):
             from tools.environments.local import served_profile_child_env
-            env = git_env(served_profile_child_env())
+            base_env = served_profile_child_env()
         from gateway.platforms import webhook_snugban_checkout as checkout
-        made = await asyncio.to_thread(
-            prepare_checkout, workspace, remote_url(self._route_config(), repo), repo, dispatch.payload["branch"],
-            dispatch.payload["project"].get("defaultBranch"), env, checkout.PREPARE_TIMEOUT_SECONDS)
-        if not made:
-            logger.info("[webhook] Snugban dispatch %s: reusing its existing checkout as it stands", dispatch.id)
+        branch = dispatch.payload["branch"]
+        found = await asyncio.to_thread(
+            prepare_checkout, workspace, remote_url(self._route_config(), repo), repo, branch,
+            dispatch.payload["project"].get("defaultBranch"), base_env, checkout.PREPARE_TIMEOUT_SECONDS)
+        if found.made or found.branch == branch:
+            return None
+        logger.info("[webhook] Snugban dispatch %s: reusing its checkout, which is on %s", dispatch.id,
+                    found.branch or "a detached HEAD")
+        # The branch name comes from a file the run can write: it reaches the prompt only if it is a plain name.
+        current = found.branch if found.branch and _BRANCH_RE.fullmatch(found.branch) else None
+        return (f"The checkout is on {current or 'another branch or a detached HEAD'}; switch to {branch} before "
+                "working, keeping any work already in it.")
 
     async def _replace_runs_of_task(self, task_id: Any) -> bool:
         """A new dispatch of a task replaces any earlier one held here (Snugban sends work back as a new

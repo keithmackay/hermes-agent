@@ -310,7 +310,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
         self._wire_plugin_handlers(None)
         from gateway.platforms.webhook_snugban_receiver import snugban_routes_connected
-        snugban_routes_connected(self)
+        snugban_routes_connected(self, is_reconnect=is_reconnect)
         return True
 
     async def disconnect(self) -> None:

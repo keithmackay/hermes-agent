@@ -854,15 +854,100 @@ class TestPreparation:
     @pytest.mark.asyncio
     async def test_leftover_scratch_folders_are_removed_when_the_route_connects(self, harness, tmp_path):
         root = tmp_path / "checkouts"
+        stale = time.time() - 3600
         for name in (f".removing-{DISPATCH_ID}-abcd1234", f".cloning-{DISPATCH_ID}-abcd1234"):
             (root / name / "x").mkdir(parents=True)
-        (root / "01KEPTDISPATCH").mkdir()
+            os.utime(root / name, (stale, stale))
+        kept = ["01KEPTDISPATCH", ".cloning-notours", f".cloning-{DISPATCH_ID}-NOTHEX12", ".removing-x-y-abcd1234z",
+                f".cloning-{DISPATCH_ID}-0123abcd"]  # the last is fresh: another process may be cloning there
+        for name in kept[:-1]:
+            (root / name).mkdir()
+            os.utime(root / name, (stale, stale))
+        (root / kept[-1]).mkdir()
         assert await harness.adapter.connect()
         try:
-            await async_wait_until(lambda: sorted(p.name for p in root.iterdir()) == ["01KEPTDISPATCH"],
-                                   timeout=10, what="the scratch folders to be removed")
+            await async_wait_until(lambda: sorted(p.name for p in root.iterdir()) == sorted(kept),
+                                   timeout=10, what="only the stale scratch folders to be removed")
         finally:
             await harness.adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_reconnect_removes_no_scratch_folder(self, harness, tmp_path):
+        scratch = tmp_path / "checkouts" / f".cloning-{DISPATCH_ID}-abcd1234"
+        scratch.mkdir(parents=True)
+        os.utime(scratch, (time.time() - 3600,) * 2)
+        assert await harness.adapter.connect(is_reconnect=True)
+        try:
+            await async_wait_until(lambda: not any(t.get_name().startswith("snugban-scratch")
+                                                   for t in harness.adapter._background_tasks), timeout=10,
+                                   what="startup work to finish")
+            assert scratch.exists()
+        finally:
+            await harness.adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_profile_routes_scratch_folders_are_cleaned_in_that_profiles_home(self, harness, tmp_path,
+                                                                                     monkeypatch):
+        from hermes_cli.profiles import get_profile_dir
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        route = harness.adapter._routes["snugban"]
+        block = {key: value for key, value in route["snugban"].items() if key != "workspace_root"}
+        monkeypatch.setitem(harness.adapter._routes, "worksnug", {**route, "profile": "work", "snugban": block})
+        scratch = get_profile_dir("work") / "snugban-checkouts" / "worksnug" / f".removing-{DISPATCH_ID}-abcd1234"
+        scratch.mkdir(parents=True)
+        assert await harness.adapter.connect()
+        try:
+            await async_wait_until(lambda: not scratch.exists(), timeout=10,
+                                   what="the profile route's scratch folder to be removed")
+        finally:
+            await harness.adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_the_users_ssh_command_from_global_config_is_kept_with_batch_mode(self, harness, tmp_path,
+                                                                                    monkeypatch):
+        calls = tmp_path / "ssh-calls"
+        script = tmp_path / "deploy-key-ssh"
+        script.write_text(f"#!/bin/sh\necho \"$*\" >> '{calls}'\nexit 1\n")
+        script.chmod(0o755)
+        global_config = tmp_path / "gitconfig"
+        global_config.write_text(f"[core]\n\tsshCommand = {script} -i /keys/deploy\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+        monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+        monkeypatch.setenv("GIT_SSH_VARIANT", "ssh")
+        monkeypatch.setitem(harness.adapter._routes["snugban"]["snugban"], "git_remote_base",
+                            "ssh://snugban-test.invalid/")
+        assert (await harness.post(_dispatch())).status == 202
+        line = calls.read_text().splitlines()[0]
+        assert "-i /keys/deploy" in line and "BatchMode=yes" in line
+
+    @pytest.mark.asyncio
+    async def test_a_reused_checkout_on_another_branch_is_named_in_the_prompt(self, harness, tmp_path):
+        workspace = tmp_path / "checkouts" / DISPATCH_ID
+        _git("clone", "--quiet", str(tmp_path / "remotes" / "keithmackay" / "demo-app.git"), str(workspace),
+             cwd=tmp_path)
+        _git("checkout", "--quiet", "-b", "wandered-off", cwd=workspace)
+        assert (await harness.post(_dispatch())).status == 202
+        prompt = harness.admitted[0].text
+        assert "The checkout is on wandered-off; switch to snugban/5a7b9c-add-a-health-endpoint" in prompt
+
+    @pytest.mark.asyncio
+    async def test_a_reused_checkout_on_its_branch_gets_no_switch_note(self, harness, tmp_path):
+        workspace = tmp_path / "checkouts" / DISPATCH_ID
+        _git("clone", "--quiet", str(tmp_path / "remotes" / "keithmackay" / "demo-app.git"), str(workspace),
+             cwd=tmp_path)
+        _git("checkout", "--quiet", "-b", "snugban/5a7b9c-add-a-health-endpoint", cwd=workspace)
+        assert (await harness.post(_dispatch())).status == 202
+        assert "switch to" not in harness.admitted[0].text
+
+    @pytest.mark.asyncio
+    async def test_a_dot_git_that_is_not_a_checkout_fails_and_is_kept(self, harness, tmp_path):
+        workspace = tmp_path / "checkouts" / DISPATCH_ID
+        workspace.mkdir(parents=True)
+        (workspace / ".git").write_text("gitdir: /somewhere/else\n")
+        assert (await harness.post(_dispatch())).status == 202
+        await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
+        assert (workspace / ".git").read_text() == "gitdir: /somewhere/else\n"
+        assert harness.admitted == []
 
 
 class TestWorkspace:
@@ -1189,6 +1274,36 @@ class TestControl:
             t.get_name().startswith("snugban-heartbeat") for t in harness.adapter._background_tasks),
             timeout=10, what="the heartbeat loop to stop")
         assert len(harness.snugban.steps("heartbeat")) <= beats + 1
+
+    @pytest.mark.asyncio
+    async def test_a_run_the_gateway_claims_as_it_is_withdrawn_is_still_stopped(self, harness, monkeypatch):
+        from hermes_state_runtime import RuntimeStoreError
+        assert (await harness.post(_dispatch())).status == 202
+        authority = harness.runner.session_authority
+
+        async def _claimed_first(actor, ref, admission_id):
+            harness.run_agent(harness.admitted[0], agent)  # the drain claims it between our read and the cancel
+            raise RuntimeStoreError("stale_generation")
+
+        agent = FakeAgent()
+        monkeypatch.setattr(authority, "cancel_queued", _claimed_first)
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        await async_wait_until(lambda: agent.interrupts, timeout=10, what="the claimed run to be stopped")
+
+    @pytest.mark.asyncio
+    async def test_a_withdrawal_that_breaks_is_logged_and_the_run_still_stopped(self, harness, monkeypatch, caplog):
+        assert (await harness.post(_dispatch())).status == 202
+        authority = harness.runner.session_authority
+
+        async def _broken(actor, ref, admission_id):
+            harness.run_agent(harness.admitted[0], agent)
+            raise ValueError("store went away")
+
+        agent = FakeAgent()
+        monkeypatch.setattr(authority, "cancel_queued", _broken)
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        await async_wait_until(lambda: agent.interrupts, timeout=10, what="the run to be stopped")
+        assert any("store went away" in str(r.exc_info) for r in caplog.records if r.levelname == "ERROR")
 
     @pytest.mark.asyncio
     async def test_an_abort_cancels_a_run_still_queued_and_removes_its_checkout(self, harness, tmp_path):

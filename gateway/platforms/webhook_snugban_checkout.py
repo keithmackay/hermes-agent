@@ -17,11 +17,13 @@ All of it shares one deadline, and a timeout kills git's whole process group."""
 import contextlib
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -34,6 +36,20 @@ PREPARE_TIMEOUT_SECONDS = 300.0
 _POST_KILL_DRAIN_SECONDS = 10.0
 _GIT_CONFIG = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", "-c", "core.askPass=")
 SCRATCH_PREFIXES = (".cloning-", ".removing-")
+# Scratch names this module makes: .cloning-<dispatchId>-<8 hex> and .removing-<dispatchId>-<8 hex>.
+_SCRATCH_NAME = re.compile(r"\.(cloning|removing)-[A-Za-z0-9_-]{1,100}-[0-9a-f]{8}")
+# A half-made clone younger than this may belong to a clone still running (another gateway sharing the
+# workspace root, or this one before a reconnect), so it is left alone.
+_STALE_CLONE_SECONDS = 2 * PREPARE_TIMEOUT_SECONDS
+_HEAD_REF = re.compile(r"ref: refs/heads/(\S+)")
+
+
+@dataclass(frozen=True)
+class Checkout:
+    """What preparation found or made: whether this call made the checkout, and the branch it is on (None
+    for a detached HEAD)."""
+    made: bool
+    branch: Optional[str]
 
 
 class CheckoutError(Exception):
@@ -41,12 +57,31 @@ class CheckoutError(Exception):
 
 
 def git_env(base: Mapping[str, str]) -> dict:
-    """*base* (the served profile's child environment) set so git and ssh fail instead of prompting."""
+    """*base* (the served profile's child environment) set so git and ssh fail instead of prompting.
+
+    ssh gets ``-o BatchMode=yes`` on top of whichever command the user chose, in git's own order: the
+    ``GIT_SSH_COMMAND`` variable, else ``core.sshCommand`` from the user's global or system git config (never a
+    checkout's), else plain ``ssh``. A ``GIT_SSH`` program (plink and the like may not take ``-o``) is left as
+    it is; git runs in a session of its own, with no terminal to prompt on."""
     env = {key: value for key, value in base.items() if key not in ("GIT_ASKPASS", "SSH_ASKPASS")}
     env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never", SSH_ASKPASS_REQUIRE="never")
-    ssh = env.get("GIT_SSH_COMMAND", "").strip() or "ssh"
+    ssh = env.get("GIT_SSH_COMMAND", "").strip() or _configured_ssh_command(env)
+    if not ssh and env.get("GIT_SSH", "").strip():
+        return env
+    ssh = ssh or "ssh"
     env["GIT_SSH_COMMAND"] = ssh if "BatchMode=yes" in ssh else f"{ssh} -o BatchMode=yes"
     return env
+
+
+def _configured_ssh_command(env: dict) -> str:
+    """``core.sshCommand`` from the user's global, else system, git config ('' when unset)."""
+    for scope in ("--global", "--system"):
+        result = subprocess.run(["git", "config", scope, "--get", "core.sshCommand"], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=10, env=env,
+                                stdin=subprocess.DEVNULL, check=False, cwd=os.path.expanduser("~"))
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return ""
 
 
 def _group_popen_kwargs() -> dict:
@@ -89,15 +124,28 @@ def _git(args: list, cwd: Path, env: dict, deadline: float, *, what: str, ok_cod
     return proc.returncode
 
 
+def _existing_checkout(workspace: Path) -> Checkout:
+    """The checkout already in *workspace*, read from ``.git/HEAD`` as a plain file: no git runs in a folder
+    whose config the run writes."""
+    git_dir = workspace / ".git"
+    head = git_dir / "HEAD"
+    if not git_dir.is_dir() or not head.is_file():
+        raise CheckoutError("the dispatch's folder holds a .git that is not a checkout")
+    match = _HEAD_REF.fullmatch(head.read_text(encoding="utf-8-sig", errors="replace").strip())
+    return Checkout(made=False, branch=match.group(1) if match else None)
+
+
 def prepare_checkout(workspace: Path, remote_url: str, repo: str, branch: str, base_branch: Optional[str],
-                     env: dict, timeout: float = PREPARE_TIMEOUT_SECONDS) -> bool:
-    """Make *workspace* a checkout of *remote_url* on *branch*; True when this call made it, False when an
-    existing checkout is reused as it stands. On failure *workspace* is left exactly as it was."""
-    if (workspace / ".git").exists():
-        return False
+                     base_env: Mapping[str, str], timeout: float = PREPARE_TIMEOUT_SECONDS) -> Checkout:
+    """Make *workspace* a checkout of *remote_url* on *branch*, or report the checkout already there, which is
+    reused as it stands. On failure *workspace* is left exactly as it was. *base_env* is the environment git
+    starts from (``git_env`` makes it non-interactive)."""
+    if (workspace / ".git").exists() or (workspace / ".git").is_symlink():
+        return _existing_checkout(workspace)
     if workspace.exists() and any(workspace.iterdir()):
         raise CheckoutError("the dispatch's folder is not empty and holds no checkout")
     deadline = time.monotonic() + timeout
+    env = git_env(base_env)
     workspace.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     scratch = workspace.with_name(f"{SCRATCH_PREFIXES[0]}{workspace.name}-{uuid.uuid4().hex[:8]}")
     scratch.mkdir(mode=0o700)
@@ -117,15 +165,22 @@ def prepare_checkout(workspace: Path, remote_url: str, repo: str, branch: str, b
     except BaseException:
         shutil.rmtree(scratch, ignore_errors=True)
         raise
-    return True
+    return Checkout(made=True, branch=branch)
 
 
 def remove_scratch(root: Path) -> int:
-    """Delete the scratch folders (half-made clones, checkouts moved aside for deletion) a stopped process
-    left under *root*; how many there were."""
+    """Delete the scratch folders a stopped process left under *root*: checkouts moved aside for deletion,
+    and half-made clones old enough that no clone can still be running there. Only names this module makes
+    are touched. Returns how many were deleted."""
     if not root.is_dir():
         return 0
-    leftovers = [path for path in root.iterdir() if path.is_dir() and path.name.startswith(SCRATCH_PREFIXES)]
+    stale_before = time.time() - _STALE_CLONE_SECONDS
+    leftovers = []
+    for path in root.iterdir():
+        match = _SCRATCH_NAME.fullmatch(path.name)
+        if match and path.is_dir() and not path.is_symlink() and (
+                match.group(1) == "removing" or path.stat().st_mtime < stale_before):
+            leftovers.append(path)
     for path in leftovers:
         shutil.rmtree(path, ignore_errors=True)
     return len(leftovers)
