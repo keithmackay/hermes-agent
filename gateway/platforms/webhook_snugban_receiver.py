@@ -86,12 +86,19 @@ def snugban_routes_connected(adapter, *, is_reconnect: bool = False) -> None:
     for route_name, route_config in adapter._routes.items():
         if isinstance(snugban_block(route_config), dict):
             # A route bound to a profile keeps its checkouts in that profile's home.
-            profile = route_config.get("profile")
-            with adapter._profile_scope(profile if isinstance(profile, str) and profile != "default" else None):
+            with adapter._profile_scope(_route_profile(route_config)):
                 root = dispatch_workspace(route_config, route_name, "_").parent
             task = asyncio.create_task(asyncio.to_thread(remove_scratch, root), name=f"snugban-scratch-{route_name}")
             adapter._background_tasks.add(task)
             task.add_done_callback(adapter._background_tasks.discard)
+
+
+def _route_profile(route_config: dict) -> Optional[str]:
+    """The profile a route is bound to, normalised as ``WebhookAdapter._route_allows_profile`` reads it; None
+    for the default profile."""
+    profile = route_config.get("profile")
+    profile = profile.strip() if isinstance(profile, str) else ""
+    return profile if profile and profile != "default" else None
 
 
 def rebind_workspaces(adapter) -> int:
@@ -406,11 +413,12 @@ class SnugbanReceiver:
         return False
 
     def _session_id_of(self, delivery_id: str) -> Optional[str]:
-        """The session the delivery was admitted to (its admission's request id is the delivery id)."""
-        from gateway.session_authorities import active_authority
-        authority = active_authority(self._runner())
-        rows = authority.db._read_all("SELECT target_session_id FROM session_admissions WHERE request_id=?",
-                                      (delivery_id,)) if authority is not None else []
+        """The session the delivery was admitted to (its admission's request id is the delivery id), looked up
+        in every served profile's store: a profile-bound route's admissions are in that profile's store, which
+        need not be the active scope's."""
+        from gateway.session_authorities import all_authorities
+        rows = [row for authority in all_authorities(self._runner()) for row in authority.db._read_all(
+            "SELECT target_session_id FROM session_admissions WHERE request_id=?", (delivery_id,))]
         return rows[0]["target_session_id"] if len(rows) == 1 else None
 
     async def _stop_delivery(self, delivery_id: str, reason: str, *, until: Optional[asyncio.Event],

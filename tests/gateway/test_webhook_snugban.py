@@ -805,7 +805,8 @@ class TestPreparation:
     @pytest.mark.asyncio
     async def test_a_preparation_that_runs_too_long_is_killed_and_fails(self, harness, tmp_path, monkeypatch):
         import gateway.platforms.webhook_snugban_checkout as checkout
-        monkeypatch.setattr(checkout, "PREPARE_TIMEOUT_SECONDS", 1.0)
+        # Long enough for git to start its transport even on a loaded machine, so the kill has a group to kill.
+        monkeypatch.setattr(checkout, "PREPARE_TIMEOUT_SECONDS", 5.0)
         pids = self._slow_remote(harness, tmp_path, monkeypatch, delay=60, child=True)
         began = time.monotonic()
         assert (await harness.post(_dispatch())).status == 202
@@ -815,6 +816,7 @@ class TestPreparation:
         assert harness.admitted == []
         assert not (tmp_path / "checkouts" / DISPATCH_ID).exists()
         assert not [p for p in (tmp_path / "checkouts").iterdir() if p.name.startswith(".cloning-")]
+        assert len(pids.read_text().split()) == 2  # the transport ran and started its child
         await async_wait_until(lambda: not any(self._alive(pid) for pid in pids.read_text().split()), timeout=10,
                                what="git's transport and its child to be killed")
 
@@ -886,13 +888,14 @@ class TestPreparation:
             await harness.adapter.disconnect()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("profile", ["work", " work "])
     async def test_a_profile_routes_scratch_folders_are_cleaned_in_that_profiles_home(self, harness, tmp_path,
-                                                                                     monkeypatch):
+                                                                                     monkeypatch, profile):
         from hermes_cli.profiles import get_profile_dir
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         route = harness.adapter._routes["snugban"]
         block = {key: value for key, value in route["snugban"].items() if key != "workspace_root"}
-        monkeypatch.setitem(harness.adapter._routes, "worksnug", {**route, "profile": "work", "snugban": block})
+        monkeypatch.setitem(harness.adapter._routes, "worksnug", {**route, "profile": profile, "snugban": block})
         scratch = get_profile_dir("work") / "snugban-checkouts" / "worksnug" / f".removing-{DISPATCH_ID}-abcd1234"
         scratch.mkdir(parents=True)
         assert await harness.adapter.connect()
@@ -938,6 +941,42 @@ class TestPreparation:
         _git("checkout", "--quiet", "-b", "snugban/5a7b9c-add-a-health-endpoint", cwd=workspace)
         assert (await harness.post(_dispatch())).status == 202
         assert "switch to" not in harness.admitted[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scope", ["active", "another profile active"])
+    async def test_a_resend_after_a_restart_onto_a_checkout_on_another_branch_is_adopted(self, harness, scope,
+                                                                                         monkeypatch):
+        assert (await harness.post(_dispatch())).status == 202
+        workspace = Path(TestWorkspace._workspace(harness, harness.admitted[0]))
+        _git("checkout", "--quiet", "-b", "wandered-off", cwd=workspace)
+        harness.adapter._snugban_receivers.clear()  # a restart
+        if scope != "active":
+            # A profile-bound route's admissions live in that profile's store, which need not be the active
+            # scope's: from the receiver's vantage the active scope serves no store (the gateway's own
+            # admission path keeps its real answer).
+            import sys
+            import gateway.session_authorities as authorities
+            real = authorities.active_authority
+
+            def _active(runner):
+                caller = sys._getframe(1).f_globals.get("__name__")
+                return None if caller == "gateway.platforms.webhook_snugban_receiver" else real(runner)
+
+            monkeypatch.setattr(authorities, "active_authority", _active)
+        assert (await harness.post(_dispatch())).status == 202
+        assert len(harness.admitted) == 1
+        await async_wait_until(lambda: len(harness.snugban.steps("ack")) == 2, timeout=10,
+                               what="the adopted run to be acknowledged again")
+
+    @pytest.mark.asyncio
+    async def test_a_symlinked_head_fails_and_is_kept(self, harness, tmp_path):
+        workspace = tmp_path / "checkouts" / DISPATCH_ID
+        (workspace / ".git").mkdir(parents=True)
+        (tmp_path / "elsewhere").write_text("ref: refs/heads/snugban/5a7b9c-add-a-health-endpoint\n")
+        (workspace / ".git" / "HEAD").symlink_to(tmp_path / "elsewhere")
+        assert (await harness.post(_dispatch())).status == 202
+        await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
+        assert (workspace / ".git" / "HEAD").is_symlink() and harness.admitted == []
 
     @pytest.mark.asyncio
     async def test_a_dot_git_that_is_not_a_checkout_fails_and_is_kept(self, harness, tmp_path):

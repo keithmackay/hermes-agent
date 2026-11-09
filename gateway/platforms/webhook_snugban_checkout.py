@@ -42,6 +42,7 @@ _SCRATCH_NAME = re.compile(r"\.(cloning|removing)-[A-Za-z0-9_-]{1,100}-[0-9a-f]{
 # workspace root, or this one before a reconnect), so it is left alone.
 _STALE_CLONE_SECONDS = 2 * PREPARE_TIMEOUT_SECONDS
 _HEAD_REF = re.compile(r"ref: refs/heads/(\S+)")
+_HEAD_READ_BYTES = 4096  # a HEAD is one short line; the run can write the file, so read no more than this
 
 
 @dataclass(frozen=True)
@@ -129,9 +130,11 @@ def _existing_checkout(workspace: Path) -> Checkout:
     whose config the run writes."""
     git_dir = workspace / ".git"
     head = git_dir / "HEAD"
-    if not git_dir.is_dir() or not head.is_file():
+    if git_dir.is_symlink() or not git_dir.is_dir() or head.is_symlink() or not head.is_file():
         raise CheckoutError("the dispatch's folder holds a .git that is not a checkout")
-    match = _HEAD_REF.fullmatch(head.read_text(encoding="utf-8-sig", errors="replace").strip())
+    with head.open("rb") as handle:
+        text = handle.read(_HEAD_READ_BYTES).decode("utf-8-sig", errors="replace")
+    match = _HEAD_REF.fullmatch(text.strip())
     return Checkout(made=False, branch=match.group(1) if match else None)
 
 
