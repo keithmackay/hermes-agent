@@ -371,6 +371,7 @@ class TestRouteConfig:
         {"base_url": "snugban.example.ts.net:7420", "agent_key": AGENT_KEY},
         {"base_url": "ftp://snugban.example.ts.net", "agent_key": AGENT_KEY},
         {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY, "workspace_root": "relative/dir"},
+        {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY, "git_remote_base": "a b"},
         {"agent_key": AGENT_KEY},
         "not a mapping",
     ])

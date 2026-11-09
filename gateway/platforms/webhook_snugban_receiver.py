@@ -32,7 +32,9 @@ _STOP_ENFORCE_LIMIT_SECONDS = 3600.0
 # settlement to wait for: it is stopped again whenever found running, for this long.
 _ORPHAN_ENFORCE_SECONDS = 300.0
 # How long a webhook waits for a stopped run to end before another run may start on its branch; under the
-# 10 s Snugban gives a webhook, so a run slower to stop gets a 503 and Snugban's retry.
+# 10 s Snugban gives a webhook. A run slower to stop gets a 503: a replacing dispatch is then resent (Snugban
+# resends an unacknowledged dispatch every 2 minutes), but a resume is sent once, so Snugban refuses it and
+# tells Keith, who can resume again.
 _SETTLE_WAIT_SECONDS = 8.0
 _LIVE_ADMISSION = frozenset({"queued", "started"})
 # Dispatch states in which the receiver heartbeats it: a run works it, or it waits for Keith's answer.
