@@ -615,6 +615,28 @@ class TestRunSettlement:
         assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
+    async def test_a_question_asked_after_context_compression_still_keeps_the_dispatch(self, harness):
+        payload = _dispatch()
+        payload["return"]["heartbeatEverySeconds"] = 0.05
+        assert (await harness.post(payload)).status == 202
+        db, first = harness.runner.session_authority.db, _session_id(harness, harness.admitted[0])
+        # Compression ends the run's session and continues it in a child: later messages land there.
+        db.append_message(first, "user", "work it")
+        db.end_session(first, "compression")
+        db.create_session("compressed-child", source="webhook", parent_session_id=first)
+        db.append_message("compressed-child", "assistant", "", tool_calls=[{
+            "id": "call_ask", "type": "function",
+            "function": {"name": "mcp__snugban__ask_keith", "arguments": "{}"}}])
+        db.append_message("compressed-child", "tool", json.dumps({"questionId": "01QAFTER"}),
+                          tool_call_id="call_ask", tool_name="mcp__snugban__ask_keith")
+        await _end_run(harness, harness.admitted[0])
+        beats = len(harness.snugban.steps("heartbeat"))
+        await async_wait_until(lambda: len(harness.snugban.steps("heartbeat")) >= beats + 2, timeout=10,
+                               what="heartbeats while waiting for Keith")
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == []
+
+    @pytest.mark.asyncio
     async def test_a_run_whose_question_was_already_answered_fails_as_usual(self, harness):
         assert (await harness.post(_dispatch())).status == 202
         agent = FakeAgent()
