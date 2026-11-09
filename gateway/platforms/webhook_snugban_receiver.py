@@ -54,8 +54,9 @@ def _tool_calls(raw: Any) -> list:
 def questions_asked(db, session_id: str) -> set:
     """The ids of the questions the run of *session_id* asked Keith with Snugban's ``ask_keith`` tool, read
     from its transcript (the tool's results carry the ``questionId`` Snugban gave each). Context compression
-    continues a session in a child, so the transcript is read from the latest continuation back."""
-    rows = db.get_messages(db.resolve_resume_session_id(session_id), include_ancestors=True)
+    continues a session in a child, so the transcript is read from the latest continuation back; in-place
+    compaction archives the rows it summarises (``compacted``), so those are read too."""
+    rows = db.get_messages(db.resolve_resume_session_id(session_id), include_ancestors=True, include_compacted=True)
     ask_calls = {call.get("id") for row in rows for call in _tool_calls(row.get("tool_calls"))
                  if str((call.get("function") or {}).get("name", "")).endswith("ask_keith")}
     asked = set()

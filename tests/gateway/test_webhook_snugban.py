@@ -678,6 +678,21 @@ class TestRunSettlement:
         assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
+    async def test_a_question_summarised_by_in_place_compaction_still_keeps_the_dispatch(self, harness):
+        payload = _dispatch()
+        payload["return"]["heartbeatEverySeconds"] = 0.05
+        assert (await harness.post(payload)).status == 202
+        _record_ask_keith(harness, harness.admitted[0], "01QINPLACE")
+        db, session_id = harness.runner.session_authority.db, _session_id(harness, harness.admitted[0])
+        db.archive_and_compact(session_id, [{"role": "user", "content": "[summary] asked Keith a question"}])
+        await _end_run(harness, harness.admitted[0])
+        beats = len(harness.snugban.steps("heartbeat"))
+        await async_wait_until(lambda: len(harness.snugban.steps("heartbeat")) >= beats + 2, timeout=10,
+                               what="heartbeats while waiting for Keith")
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == []
+
+    @pytest.mark.asyncio
     async def test_a_run_whose_question_was_already_answered_fails_as_usual(self, harness):
         assert (await harness.post(_dispatch())).status == 202
         agent = FakeAgent()
