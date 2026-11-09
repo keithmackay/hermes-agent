@@ -198,6 +198,15 @@ def _decision_prompt(payload: dict) -> str:
         "you hold a running dispatch for it."])
 
 
+def _json_object(text: str) -> Optional[dict]:
+    """The JSON object *text* holds, else None: an answer may be empty (chunked or not) or not JSON."""
+    try:
+        answer = json.loads(text) if text.strip() else None
+    except ValueError:
+        return None
+    return answer if isinstance(answer, dict) else None
+
+
 class SnugbanClient:
     """Snugban's peer REST API, called with the agent key."""
 
@@ -217,12 +226,12 @@ class SnugbanClient:
                                              skip_auto_headers=("Content-Type",)) as session:
                 async with session.post(url, headers=headers, allow_redirects=False,
                                         data=None if body is None else json.dumps(body)) as resp:
-                    answer = await resp.json(content_type=None) if resp.content_length != 0 else None
+                    text = await resp.text()
                     if resp.status >= 300:
                         logger.warning("[webhook] Snugban answered %s to %s of dispatch %s", resp.status, step,
                                        dispatch_id)
-                    return resp.status, answer if isinstance(answer, dict) else None
-        except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+                    return resp.status, _json_object(text)
+        except (aiohttp.ClientError, TimeoutError, UnicodeDecodeError) as exc:
             logger.warning("[webhook] Could not send %s of dispatch %s to Snugban: %s", step, dispatch_id,
                            type(exc).__name__)
             return 0, None
@@ -413,17 +422,27 @@ class SnugbanReceiver:
 
     async def _keep_alive(self, dispatch_id: str, dispatch: _Dispatch, interval: float) -> None:
         """Heartbeat the dispatch while its run works it, so stall detection does not depend on the model."""
-        client = self._client()
         while dispatch.state == "running":
             await asyncio.sleep(interval)
             if dispatch.state != "running":
                 return
-            self._deliver_pending_decisions(dispatch)
-            status, answer = await client.report(dispatch_id, "heartbeat")
-            if status in (404, 409) or (answer or {}).get("state") == "waiting_input":
-                logger.info("[webhook] Snugban dispatch %s is no longer worked here (%s); heartbeats stop",
-                            dispatch_id, status)
-                return
+            try:
+                if not await self._heartbeat_once(dispatch_id, dispatch):
+                    return
+            except Exception:
+                # One broken tick must not end the heartbeats: Snugban would then see a stall.
+                logger.exception("[webhook] Snugban heartbeat of dispatch %s failed; trying again next tick",
+                                 dispatch_id)
+
+    async def _heartbeat_once(self, dispatch_id: str, dispatch: _Dispatch) -> bool:
+        """Deliver held answers and send one heartbeat; False once Snugban says the dispatch is not worked here."""
+        self._deliver_pending_decisions(dispatch)
+        status, answer = await self._client().report(dispatch_id, "heartbeat")
+        if status in (404, 409) or (answer or {}).get("state") == "waiting_input":
+            logger.info("[webhook] Snugban dispatch %s is no longer worked here (%s); heartbeats stop",
+                        dispatch_id, status)
+            return False
+        return True
 
     # --- webhook types ---
 
@@ -432,6 +451,8 @@ class SnugbanReceiver:
         _require_dispatch_shape(payload)
         if dispatch_id in self._dispatches:
             logger.info("[webhook] Snugban dispatch %s sent again; already taken", dispatch_id)
+            if self._dispatches[dispatch_id].state == "running":
+                self._report(dispatch_id, "ack")  # the resend means Snugban missed the first ack
             return _json({"status": "duplicate", "dispatchId": dispatch_id})
         dispatch = self._dispatches[dispatch_id] = _Dispatch(payload)
         outcome = await self._start_run(dispatch_id, dispatch, _dispatch_prompt(payload),
@@ -459,7 +480,8 @@ class SnugbanReceiver:
         dispatch_id = _valid_id(payload, "dispatchId")
         dispatch = self._dispatches.get(dispatch_id)
         if dispatch is None or dispatch.state != "running":
-            return _json({"status": "not_running", "dispatchId": dispatch_id})
+            # The protocol's answer for a dispatch not running here: Snugban then records no pause.
+            return _json({"error": f"Dispatch {dispatch_id} is not running here"}, 404)
         dispatch.state = "paused"
         self._stop_heartbeat(dispatch)
         if dispatch.run is not None and not dispatch.run.settled:
@@ -471,7 +493,7 @@ class SnugbanReceiver:
         dispatch_id = _valid_id(payload, "dispatchId")
         dispatch = self._dispatches.get(dispatch_id)
         if dispatch is None or dispatch.state != "paused" or dispatch.payload is None:
-            return _json({"status": "not_paused", "dispatchId": dispatch_id})
+            return _json({"error": f"Dispatch {dispatch_id} is not paused here"}, 404)
         decisions, dispatch.pending_decisions = tuple(dispatch.pending_decisions), []
         prompt = _dispatch_prompt(dispatch.payload, resumed=True, decisions=decisions)
         outcome = await self._start_run(dispatch_id, dispatch, prompt, f"snugban:resume:{dispatch_id}:{delivery_id}")

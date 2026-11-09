@@ -85,6 +85,7 @@ class FakeSnugban:
     def __init__(self):
         self.requests: list[dict] = []
         self.status: dict[str, int] = {}
+        self.empty_chunked: set[str] = set()  # steps answered with an empty chunked body
         self.state = "running"
         app = web.Application()
         app.router.add_post("/api/peer/dispatches/{id}/{step}", self._report)
@@ -95,6 +96,12 @@ class FakeSnugban:
         self.requests.append({"step": step, "id": dispatch_id, "auth": request.headers.get("Authorization"),
                               "content_type": request.headers.get("Content-Type"),
                               "body": await request.read()})
+        if step in self.empty_chunked:
+            resp = web.StreamResponse(status=self.status.get(step, 200))
+            resp.enable_chunked_encoding()
+            await resp.prepare(request)
+            await resp.write_eof()
+            return resp
         return web.json_response({"dispatchId": dispatch_id, "state": self.state}, status=self.status.get(step, 200))
 
     def steps(self, step: str) -> list[dict]:
@@ -419,6 +426,44 @@ class TestDispatch:
         assert len(harness.snugban.steps("heartbeat")) == 1
 
     @pytest.mark.asyncio
+    async def test_an_ended_answer_with_an_empty_chunked_body_stops_heartbeats(self, harness):
+        harness.snugban.status["heartbeat"] = 404
+        harness.snugban.empty_chunked.add("heartbeat")
+        payload = _dispatch()
+        payload["return"]["heartbeatEverySeconds"] = 0.05
+        assert (await harness.post(payload)).status == 202
+        await async_wait_until(lambda: harness.snugban.steps("heartbeat"), timeout=10, what="a heartbeat")
+        await async_wait_until(lambda: not any(
+            t.get_name().startswith("snugban-heartbeat") for t in harness.adapter._background_tasks),
+            timeout=10, what="the heartbeat loop to end")
+        assert len(harness.snugban.steps("heartbeat")) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failing_heartbeat_tick_is_logged_and_the_loop_goes_on(self, harness, monkeypatch, caplog):
+        payload = _dispatch()
+        payload["return"]["heartbeatEverySeconds"] = 0.05
+        assert (await harness.post(payload)).status == 202
+        receiver = harness.adapter._snugban_receivers[("default", "snugban")]
+        calls = []
+
+        def _flaky(dispatch):
+            calls.append(dispatch)
+            if len(calls) == 1:
+                raise RuntimeError("decision delivery broke")
+
+        monkeypatch.setattr(receiver, "_deliver_pending_decisions", _flaky)
+        await async_wait_until(lambda: len(harness.snugban.steps("heartbeat")) >= 2, timeout=10,
+                               what="heartbeats after the failing tick")
+        assert any("decision delivery broke" in (r.exc_text or "") or "decision delivery broke" in str(r.exc_info)
+                   for r in caplog.records if r.levelname == "ERROR")
+
+    @pytest.mark.asyncio
+    async def test_a_dispatch_sent_again_is_acknowledged_again(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        assert (await harness.post(_dispatch())).status == 200
+        await async_wait_until(lambda: len(harness.snugban.steps("ack")) == 2, timeout=10, what="a second ack")
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("change", [
         {"branch": None}, {"task": None}, {"project": None}, {"instructions": None},
         {"dispatchId": "../../api/peer/heartbeat"}, {"dispatchId": ""}, {"task": {"title": "no id"}},
@@ -586,11 +631,17 @@ class TestControl:
         assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
-    async def test_resume_of_a_dispatch_not_paused_starts_nothing(self, harness):
+    async def test_resume_of_a_dispatch_not_paused_is_not_found(self, harness):
         assert (await harness.post(_dispatch())).status == 202
         resp = await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})
-        assert resp.status == 200
+        assert resp.status == 404
         assert len(harness.admitted) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["pause", "resume"])
+    async def test_pause_or_resume_of_a_dispatch_not_here_is_not_found(self, harness, kind):
+        resp = await harness.post({"type": kind, "dispatchId": DISPATCH_ID})
+        assert resp.status == 404
 
     @pytest.mark.asyncio
     async def test_status_request_heartbeats_a_live_dispatch(self, harness):
