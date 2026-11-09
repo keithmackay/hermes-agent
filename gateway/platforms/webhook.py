@@ -25,7 +25,7 @@ from collections import deque
 from datetime import datetime, timezone, UTC
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 try:
     from aiohttp import web
@@ -811,11 +811,13 @@ class WebhookAdapter(BasePlatformAdapter):
         return source
 
     async def _admit_agent_run(self, payload: Any, prompt: str, delivery_id: str, now: float, *, route_config: dict,
-                               route_name: str, profile, event_type: str,
-                               on_settled: Optional[Callable[[], None]] = None) -> Optional[str]:
+                               route_name: str, profile, event_type: str, watch=None) -> Optional[str]:
         """Record delivery info and admit the run through the durable producer (shared by the immediate
         and coalesced paths). ``"accepted"`` / ``"duplicate"``, or None when admission failed.
-        ``on_settled`` is called once an accepted run has ended."""
+        ``watch`` follows the committed run, a duplicate's earlier one included: ``watch.admitted(session_id,
+        db, status)`` once it is committed (``status``: its admission's status then), then ``watch.settled(status)`` when it ends, with the admission's final
+        status (``"terminal"``, ``"unknown"``, ...) or None when that could not be read. A shutdown that
+        cancels the wait reports nothing: the run resumes after the restart."""
         # (profile, route, delivery_id) in the session key → concurrent webhooks get independent runs.
         identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
         session_chat_id = identity.session_chat_id
@@ -839,6 +841,8 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.exception("[webhook] Durable admission failed for %s", delivery_id)
             return None
         if getattr(event, '_webhook_duplicate', False):
+            if watch is not None and receipt is not None:
+                self._follow_admission(event, receipt, watch)
             return "duplicate"
         if receipt is None:
             # A post_gateway_admission plugin consumed the delivery: nothing was committed, so the
@@ -848,21 +852,28 @@ class WebhookAdapter(BasePlatformAdapter):
                 from gateway.platforms.webhook_delivery import snapshot_destination
                 await self._deliver_to(snapshot_destination(self, self._delivery_info.get(session_chat_id)),
                                        session_chat_id, reply)
-            if on_settled is not None:
-                on_settled()
+            if watch is not None:
+                watch.settled("terminal")
             return "accepted"
+        self._follow_admission(event, receipt, watch)
+        return "accepted"
+
+    def _follow_admission(self, event, receipt, watch) -> None:
+        """Finalize the committed delivery once its run settles, reporting it to ``watch`` (if any)."""
         from gateway.session_authorities import active_authority, authority_for_profile_id
         runner = self._message_handler.__self__
         authority = authority_for_profile_id(runner, receipt.ref.profile_id) or active_authority(runner)
+        if watch is not None:
+            watch.admitted(receipt.ref.session_id, authority.db, receipt.status)
         task = asyncio.create_task(self._finalize_delivery(event, authority, receipt))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-        if on_settled is not None:
-            # A cancelled finalization is a shutdown, not the run ending: the run resumes after restart.
-            task.add_done_callback(lambda done: None if done.cancelled() else on_settled())
-        return "accepted"
+        if watch is not None:
+            task.add_done_callback(lambda done: None if done.cancelled() else watch.settled(done.result()))
 
-    async def _finalize_delivery(self, event, authority, receipt):
+    async def _finalize_delivery(self, event, authority, receipt) -> Optional[str]:
+        """End the webhook session once its run settles; the admission's final status, or None when it
+        could not be read."""
         from hermes_state_runtime import get_session_admission
         try:
             row = get_session_admission(authority.db, admission_id=receipt.admission_id)
@@ -875,6 +886,8 @@ class WebhookAdapter(BasePlatformAdapter):
             await self._end_webhook_session(event, event.source.chat_id)
         except Exception:
             logger.exception("[webhook] Could not finalize admitted delivery %s", receipt.admission_id)
+            return None
+        return row['status']
 
     async def _end_webhook_session(self, event: MessageEvent, session_chat_id: str) -> None:
         from gateway.platforms.webhook_ingress import finalize_webhook

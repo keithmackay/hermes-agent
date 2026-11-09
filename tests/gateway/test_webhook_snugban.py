@@ -508,36 +508,81 @@ class TestDispatch:
         unknown = await harness.post({"type": "something_new", "dispatchId": DISPATCH_ID})
         assert unknown.status == 200 and (await unknown.json())["status"] == "ignored"
 
+
+async def _end_run(harness, event, status: str = "terminal") -> None:
+    """End the admitted run of *event* as the authority would: its admission reaches *status* and its
+    settlement waiter resolves. Route tests never execute admitted runs."""
+    authority = harness.runner.session_authority
+    row = authority.db._read_all("SELECT admission_id FROM session_admissions WHERE request_id=?",
+                                 (event.message_id,))[0]
+    waiter = await async_wait_until(lambda: authority.waiters.get(row["admission_id"]), timeout=10,
+                                    what="the run's settlement waiter")
+    authority.db._execute_write(lambda conn: conn.execute(
+        "UPDATE session_admissions SET status=? WHERE admission_id=?", (status, row["admission_id"])))
+    waiter.set_result(None)
+
+
+async def _reports_done(harness) -> None:
+    await async_wait_until(lambda: not any(
+        t.get_name().startswith("snugban-report") or t.get_name().startswith("snugban-ended")
+        for t in harness.adapter._background_tasks), timeout=10, what="the receiver's reports to finish")
+
+
+def _session_id(harness, event) -> str:
+    authority = harness.runner.session_authority
+    return authority.db._read_all("SELECT target_session_id FROM session_admissions WHERE request_id=?",
+                                  (event.message_id,))[0]["target_session_id"]
+
+
+def _record_ask_keith(harness, event, question_id: str) -> None:
+    """The run's transcript as the agent writes it after calling Snugban's ask_keith tool."""
+    db, session_id = harness.runner.session_authority.db, _session_id(harness, event)
+    db.append_message(session_id, "assistant", "", tool_calls=[{
+        "id": "call_ask", "type": "function",
+        "function": {"name": "mcp__snugban__ask_keith", "arguments": json.dumps({"question": "Port?"})}}])
+    db.append_message(session_id, "tool", json.dumps({"questionId": question_id}), tool_call_id="call_ask",
+                      tool_name="mcp__snugban__ask_keith")
+
+
+class TestRunSettlement:
+    """The admitted run's end, as its admission's settlement reports it."""
+
     @pytest.mark.asyncio
-    async def test_a_run_that_ends_without_reporting_fails_the_dispatch(self, harness, monkeypatch):
-        settled = _capture_settlements(harness, monkeypatch)
+    async def test_a_run_that_ends_without_reporting_fails_the_dispatch(self, harness):
         assert (await harness.post(_dispatch())).status == 202
-        settled[0]()
+        await _end_run(harness, harness.admitted[0])
         await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
         fail = harness.snugban.steps("fail")[0]
         assert fail["auth"] == f"Bearer {AGENT_KEY}"
         assert "ended without" in json.loads(fail["body"])["reason"]
 
-
-class TestRunSettlement:
-    """The admitted run's end, as the authority signals it (its admission's waiter resolving)."""
-
-    @staticmethod
-    async def _waiter(harness):
-        authority = harness.runner.session_authority
-        return await async_wait_until(lambda: next(iter(authority.waiters.values()), None), timeout=10,
-                                      what="the run's settlement waiter")
+    @pytest.mark.asyncio
+    async def test_a_run_whose_outcome_is_unknown_does_not_fail_the_dispatch(self, harness):
+        payload = _dispatch()
+        payload["return"]["heartbeatEverySeconds"] = 0.05
+        assert (await harness.post(payload)).status == 202
+        await _end_run(harness, harness.admitted[0], status="unknown")
+        await async_wait_until(lambda: not any(
+            t.get_name().startswith("snugban-heartbeat") for t in harness.adapter._background_tasks),
+            timeout=10, what="the heartbeats to stop")
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
-    async def test_the_run_ending_fails_a_dispatch_it_left_open(self, harness):
+    async def test_a_finalization_that_failed_does_not_fail_the_dispatch(self, harness, monkeypatch):
+        async def _broken(event, authority, receipt):
+            return None  # what _finalize_delivery returns when it could not read the outcome
+
+        monkeypatch.setattr(harness.adapter, "_finalize_delivery", _broken)
         assert (await harness.post(_dispatch())).status == 202
-        (await self._waiter(harness)).set_result(None)
-        await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
     async def test_a_shutdown_cancelling_the_wait_is_not_the_run_ending(self, harness):
         assert (await harness.post(_dispatch())).status == 202
-        await self._waiter(harness)
+        authority = harness.runner.session_authority
+        await async_wait_until(lambda: authority.waiters, timeout=10, what="the run's settlement waiter")
         for task in list(harness.adapter._background_tasks):
             if not task.get_name().startswith("snugban-"):
                 task.cancel()
@@ -546,19 +591,96 @@ class TestRunSettlement:
             what="the finalization to be cancelled")
         assert harness.snugban.steps("fail") == []
 
+    @pytest.mark.asyncio
+    async def test_a_run_waiting_for_keith_keeps_the_dispatch_and_his_answer_continues_it(self, harness):
+        payload = _dispatch()
+        payload["return"]["heartbeatEverySeconds"] = 0.05
+        assert (await harness.post(payload)).status == 202
+        _record_ask_keith(harness, harness.admitted[0], "01QASKED")
+        await _end_run(harness, harness.admitted[0])
+        beats = len(harness.snugban.steps("heartbeat"))
+        await async_wait_until(lambda: len(harness.snugban.steps("heartbeat")) >= beats + 2, timeout=10,
+                               what="heartbeats while waiting for Keith")
+        assert harness.snugban.steps("fail") == []
+        resp = await harness.post({"type": "decision", "questionId": "01QASKED", "taskId": TASK_ID,
+                                   "answer": "Use port 8080."})
+        assert resp.status == 202
+        assert len(harness.admitted) == 2
+        prompt = harness.admitted[1].text
+        assert "Use port 8080." in prompt and "Add a /health endpoint" in prompt and DISPATCH_ID in prompt
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == []
 
-def _capture_settlements(harness, monkeypatch) -> list:
-    """The ``on_settled`` callback of each run the receiver admits, to end a run by hand: route tests
-    never execute admitted runs."""
-    settled = []
-    original = harness.adapter._admit_agent_run
+    @pytest.mark.asyncio
+    async def test_a_run_whose_question_was_already_answered_fails_as_usual(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        agent = FakeAgent()
+        harness.run_agent(harness.admitted[0], agent)
+        assert (await harness.post({"type": "decision", "questionId": "01QASKED", "taskId": TASK_ID,
+                                    "answer": "Use port 8080."})).status == 200
+        _record_ask_keith(harness, harness.admitted[0], "01QASKED")
+        await _end_run(harness, harness.admitted[0])
+        await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
 
-    async def _admit(*args, on_settled=None, **kwargs):
-        settled.append(on_settled)
-        return await original(*args, on_settled=on_settled, **kwargs)
 
-    monkeypatch.setattr(harness.adapter, "_admit_agent_run", _admit)
-    return settled
+class TestRestart:
+    """The receiver forgets everything on a gateway restart; durable admission does not."""
+
+    @staticmethod
+    def _restart(harness):
+        harness.adapter._snugban_receivers.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_resend_of_a_dispatch_whose_run_lives_is_adopted(self, harness):
+        payload = _dispatch()
+        payload["return"]["heartbeatEverySeconds"] = 0.05
+        assert (await harness.post(payload)).status == 202
+        agent = FakeAgent()
+        harness.run_agent(harness.admitted[0], agent)
+        self._restart(harness)
+        resend = await harness.post(payload)
+        assert resend.status == 200 and (await resend.json())["status"] == "duplicate"
+        assert len(harness.admitted) == 1
+        await async_wait_until(lambda: len(harness.snugban.steps("ack")) == 2, timeout=10, what="a re-ack")
+        await async_wait_until(lambda: harness.snugban.steps("heartbeat"), timeout=10, what="heartbeats")
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
+        assert agent.interrupts
+
+    @pytest.mark.asyncio
+    async def test_a_resend_of_a_dispatch_whose_run_ended_is_dropped(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        await _end_run(harness, harness.admitted[0], status="unknown")
+        await _reports_done(harness)
+        self._restart(harness)
+        resend = await harness.post(_dispatch())
+        assert resend.status == 200
+        assert len(harness.admitted) == 1
+        requests = len(harness.snugban.requests)
+        assert (await harness.post({"type": "status_request", "dispatchId": DISPATCH_ID})).status == 200
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 404
+        await _reports_done(harness)
+        assert len(harness.snugban.requests) == requests
+
+    @pytest.mark.asyncio
+    async def test_an_abort_after_a_restart_stops_the_dispatch_session(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        agent = FakeAgent()
+        harness.run_agent(harness.admitted[0], agent)
+        self._restart(harness)
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        assert agent.interrupts
+
+    @pytest.mark.asyncio
+    async def test_an_abort_after_a_restart_stops_a_resumed_session_too(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
+        await _end_run(harness, harness.admitted[0])
+        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
+        agent = FakeAgent()
+        harness.run_agent(harness.admitted[1], agent)
+        self._restart(harness)
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        assert agent.interrupts
 
 
 # ---------------------------------------------------------------------------
@@ -600,34 +722,28 @@ class TestControl:
         assert harness.admitted == []
 
     @pytest.mark.asyncio
-    async def test_an_aborted_run_ending_does_not_fail_the_dispatch(self, harness, monkeypatch):
-        settled = _capture_settlements(harness, monkeypatch)
+    async def test_an_aborted_run_ending_does_not_fail_the_dispatch(self, harness):
         assert (await harness.post(_dispatch())).status == 202
         assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
-        settled[0]()
-        await async_wait_until(lambda: not any(
-            t.get_name().startswith("snugban-report") for t in harness.adapter._background_tasks),
-            timeout=10, what="the receiver's reports to finish")
+        await _end_run(harness, harness.admitted[0])
+        await _reports_done(harness)
         assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
-    async def test_pause_stops_the_run_and_resume_starts_one_on_the_branch(self, harness, monkeypatch):
-        settled = _capture_settlements(harness, monkeypatch)
+    async def test_pause_stops_the_run_and_resume_starts_one_on_the_branch(self, harness):
         assert (await harness.post(_dispatch())).status == 202
         agent = FakeAgent()
         harness.run_agent(harness.admitted[0], agent)
         assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
         assert agent.interrupts
-        settled[0]()
+        await _end_run(harness, harness.admitted[0])
         assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
         assert len(harness.admitted) == 2
         resumed = harness.admitted[1].text
         assert "resume on the branch as you find it" in resumed
         assert "Add a /health endpoint" in resumed and DISPATCH_ID in resumed
         assert harness.admitted[1].source.chat_id != harness.admitted[0].source.chat_id
-        await async_wait_until(lambda: not any(
-            t.get_name().startswith("snugban-report") for t in harness.adapter._background_tasks),
-            timeout=10, what="the receiver's reports to finish")
+        await _reports_done(harness)
         assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
