@@ -584,6 +584,79 @@ Behavior and safety properties:
 
 ---
 
+## Snugban dispatches {#snugban}
+
+Snugban is a coordinator that dispatches coding tasks to agents and steers them with signed webhooks. A route with a `snugban:` block receives them: each `dispatch` becomes a Hermes agent run on the dispatch's branch, and the route answers Snugban's other webhooks itself. Snugban's `docs/agent-protocol.md` is the protocol's source of truth; its `docs/agents/hermes.md` covers registering Hermes and connecting the Snugban MCP server.
+
+### 1. Register Hermes in Snugban
+
+On Snugban's **Agents** page, register the agent with kind `hermes` and the webhook URL where this gateway is reachable from Snugban. With Hermes on another host of your tailnet:
+
+```
+http://<hermes-host>.<tailnet>.ts.net:8644/webhooks/snugban
+```
+
+Snugban cannot change a webhook URL after registration, so check the host name and port first. Click **Issue key**, and put the two values Snugban shows in the profile's `.env` (secrets only, never in `config.yaml`):
+
+```bash
+SNUGBAN_AGENT_KEY=sb_agent_...
+SNUGBAN_WEBHOOK_SECRET=...
+```
+
+### 2. Add the MCP server and the route
+
+The run talks to Snugban through its MCP tools (`mcp__snugban__*`), so add Snugban as an MCP server first (`hermes mcp add snugban --url <snugban>/mcp --auth header`, see Snugban's `docs/agents/hermes.md`). Then add the route:
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: "100.64.0.12"      # this host's Tailscale IP: `tailscale ip -4`
+      port: 8644
+      routes:
+        snugban:
+          secret: "${SNUGBAN_WEBHOOK_SECRET}"
+          toolsets: ["mcp-snugban", "terminal", "file"]
+          snugban:
+            base_url: "http://<snugban-host>.<tailnet>.ts.net:7420"
+            agent_key: "${SNUGBAN_AGENT_KEY}"
+```
+
+- **`host`**: bind the listener to the host's Tailscale IP, so only the tailnet can reach it. Without `host` the listener binds every interface, including any public one.
+- **`base_url`**: Snugban's URL as this host reaches it. Snugban must listen on its own Tailscale address (`[server] host` in Snugban's config) for that to work.
+- **`toolsets`**: webhook runs otherwise get only a web-search toolset. The run needs `mcp-snugban` for its reports and `terminal` and `file` to do the work; add what else the projects need.
+- **Refused at startup**: the route will not start when `secret` or `agent_key` is empty or still reads `${...}` (the variable is not set), when `secret` is `INSECURE_NO_AUTH`, or when `base_url` is not an `http(s)` URL.
+
+Hermes must be able to clone and push the projects' GitHub repositories from this host (`gh auth login` or SSH keys).
+
+### What each webhook does
+
+| Webhook | Hermes |
+| --- | --- |
+| `dispatch` | Starts one agent run whose prompt holds the whole task (title, description, definition of done, project, branch, instructions and any `revision.changes`) inside an untrusted-data block, with the rules for working it: continue or create the branch, report progress, push, then `complete_dispatch` with the pushed `headSha`, or `fail_dispatch`. The route acknowledges the dispatch over REST at once and sends its heartbeat every `heartbeatEverySeconds` (60) while the run works, so Snugban's stall detection does not depend on the model. A dispatch sent again (same `dispatchId`) is not run again. If the run ends without completing or failing the dispatch, the route fails it with that reason, so the task goes back to Snugban's queue. |
+| `pause` | Stops the run the way `/stop` does, at the next tool boundary. A Hermes run cannot be frozen and continued, so pausing ends it. Heartbeats stop. |
+| `resume` | Starts a new run with the original task and the instruction to resume on the branch as it finds it, then heartbeats it. |
+| `abort` | Stops the run as `pause` does, keeps stopping it if it was still queued and starts later, and never runs that `dispatchId` again, so nothing more is pushed to its branch. |
+| `status_request` | Sends a heartbeat for a dispatch whose run is working. A dispatch with no run here gets none, so a stall stays visible to Snugban. |
+| `decision` | Keith's answer (or dismissal) to a question the agent asked with `ask_keith`. It goes into the live run of the question's task between tool calls, like `/steer`. If that run is paused or not started yet, it goes with the next one. With no run for the task, it starts a new run with the answer. Each `questionId` is acted on once. |
+
+Unknown webhook types are answered `200` and ignored.
+
+### Security
+
+- Only Snugban's own signature is accepted on this route: `X-Snugban-Signature: sha256=<hex HMAC-SHA256 of "<X-Snugban-Timestamp>.<raw body>">`, checked in constant time against the raw body before it is parsed. Hermes's other schemes, including Generic V2 headers Snugban may also send, are ignored here.
+- A timestamp more than 5 minutes from this host's clock is refused, and so is an `X-Snugban-Delivery` id seen before (`409`). Keep the host's clock synchronised.
+- The agent key and the webhook secret are never logged or put in a prompt. If one leaks, issue a new key in Snugban (it replaces the secret too) and update `.env`.
+- Task text can come from other agents. The prompt marks it as untrusted data, but the run still has the tools you granted, so grant only what the projects need and keep the listener on the tailnet.
+
+### Limits
+
+- Dispatch, question and delivery bookkeeping is in memory. After a gateway restart the route no longer heartbeats a dispatch it took before, or stops its run on `pause` or `abort`; a run that carries on reports through its own MCP calls, and one that does not is left to Snugban's stall handling. A dispatch Snugban sends again keeps its delivery identity, so it is not admitted twice.
+- A pause ends the run rather than freezing it; work not yet committed when it stops is left in the working tree for the resumed run to find.
+
+---
+
 ## Security {#security}
 
 The webhook adapter includes multiple layers of security:
