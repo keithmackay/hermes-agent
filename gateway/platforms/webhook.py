@@ -309,9 +309,8 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.info("[webhook] Listening on %s:%d — routes: %s", self._host or "* (all interfaces, IPv4+IPv6)",
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
         self._wire_plugin_handlers(None)
-        from gateway.platforms.webhook_snugban_receiver import rebind_workspaces
-        if bound := rebind_workspaces(self):
-            logger.info("[webhook] Rebound %d Snugban dispatch run(s) to their checkouts", bound)
+        from gateway.platforms.webhook_snugban_receiver import snugban_routes_connected
+        snugban_routes_connected(self)
         return True
 
     async def disconnect(self) -> None:

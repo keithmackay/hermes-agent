@@ -8,9 +8,11 @@ sha256=<hex HMAC-SHA256(secret, "<X-Snugban-Timestamp>.<raw body>")>``, sends a 
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -156,7 +158,12 @@ class Harness:
         return self.adapter._message_handler.__self__
 
     def run_agent(self, event, agent):
-        """Put *agent* in the gateway's running slot of the session *event* was admitted to."""
+        """Start *event*'s admitted run as the drain would (its admission claimed, ``started``) with *agent* in
+        the gateway's running slot of its session."""
+        authority = self.runner.session_authority
+        authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET status='started', owner_epoch=?, generation=1 "
+            "WHERE request_id=? AND status='queued'", (authority.epoch, event.message_id)))
         self.runner._running_agents[self.runner._session_key_for_source(event.source)] = agent
 
 
@@ -372,6 +379,12 @@ class TestRouteConfig:
         {"base_url": "ftp://snugban.example.ts.net", "agent_key": AGENT_KEY},
         {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY, "workspace_root": "relative/dir"},
         {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY, "git_remote_base": "a b"},
+        {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY,
+         "git_remote_base": "https://github.com"},
+        {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY,
+         "git_remote_base": "https://ghp_token@github.com/"},
+        {"base_url": "http://snugban.example.ts.net:7420", "agent_key": AGENT_KEY,
+         "git_remote_base": "https://keith:secret@github.com/"},
         {"agent_key": AGENT_KEY},
         "not a mapping",
     ])
@@ -379,6 +392,13 @@ class TestRouteConfig:
         adapter = _adapter(_route("unused", snugban=block))
         with pytest.raises(ValueError, match="snugban"):
             await adapter.connect()
+
+    @pytest.mark.parametrize("base", ["https://github.com/", "git@github.com:", "ssh://git@github.com/"])
+    def test_plain_git_remote_bases_are_accepted(self, base):
+        from gateway.platforms.webhook_snugban import snugban_route_problem
+        route = _route("http://snugban.example.ts.net:7420")
+        route["snugban"]["git_remote_base"] = base
+        assert snugban_route_problem(route, SECRET) is None
 
     @pytest.mark.asyncio
     async def test_a_dynamic_route_with_an_unset_secret_is_skipped(self, tmp_path, monkeypatch):
@@ -551,13 +571,14 @@ async def _end_run(harness, event, status: str = "terminal") -> None:
     """End the admitted run of *event* as the authority would: its admission reaches *status* and its
     settlement waiter resolves. Route tests never execute admitted runs."""
     authority = harness.runner.session_authority
-    row = authority.db._read_all("SELECT admission_id FROM session_admissions WHERE request_id=?",
+    row = authority.db._read_all("SELECT admission_id, status FROM session_admissions WHERE request_id=?",
                                  (event.message_id,))[0]
-    waiter = await async_wait_until(lambda: authority.waiters.get(row["admission_id"]), timeout=10,
-                                    what="the run's settlement waiter")
-    authority.db._execute_write(lambda conn: conn.execute(
-        "UPDATE session_admissions SET status=? WHERE admission_id=?", (status, row["admission_id"])))
-    waiter.set_result(None)
+    if row["status"] != "terminal":  # a run stopped while still queued was withdrawn: it has ended already
+        waiter = await async_wait_until(lambda: authority.waiters.get(row["admission_id"]), timeout=10,
+                                        what="the run's settlement waiter")
+        authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET status=? WHERE admission_id=?", (status, row["admission_id"])))
+        waiter.set_result(None)
     # The run has ended once the receiver following it saw it end and handled that.
     runs = [d.run for receiver in harness.adapter._snugban_receivers.values()
             for d in receiver._dispatches.values() if d.run is not None and d.run.delivery_id == event.message_id]
@@ -570,6 +591,12 @@ async def _reports_done(harness) -> None:
     await async_wait_until(lambda: not any(
         t.get_name().startswith("snugban-report") or t.get_name().startswith("snugban-ended")
         for t in harness.adapter._background_tasks), timeout=10, what="the receiver's reports to finish")
+
+
+def _admission_status(harness, event) -> str:
+    authority = harness.runner.session_authority
+    return authority.db._read_all("SELECT status FROM session_admissions WHERE request_id=?",
+                                  (event.message_id,))[0]["status"]
 
 
 def _session_id(harness, event) -> str:
@@ -704,6 +731,140 @@ class TestRunSettlement:
         await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
 
 
+class TestPreparation:
+    """How the receiver makes (or reuses) a dispatch's checkout, against real git repositories."""
+
+    @staticmethod
+    def _restart(harness):
+        harness.adapter._snugban_receivers.clear()
+
+    @staticmethod
+    def _slow_remote(harness, tmp_path, monkeypatch, delay: float, child: bool = False):
+        """Point the route at an ssh remote whose transport is a script that waits *delay* seconds and fails: a
+        clone that hangs, then breaks. With *child* it first starts a long-lived child of its own. Returns the
+        file the script writes its pids to."""
+        pids = tmp_path / "ssh-pids"
+        script = tmp_path / "fake-ssh"
+        spawn = f"sleep 60 &\necho $! >> '{pids}'\n" if child else ""
+        script.write_text(f"#!/bin/sh\necho $$ >> '{pids}'\n{spawn}sleep {delay}\nexit 1\n")
+        script.chmod(0o755)
+        monkeypatch.setenv("GIT_SSH_COMMAND", str(script))
+        monkeypatch.setenv("GIT_SSH_VARIANT", "ssh")  # no `-G` probe: one transport run per clone
+        block = harness.adapter._routes["snugban"]["snugban"]
+        monkeypatch.setitem(block, "git_remote_base", "ssh://snugban-test.invalid/")
+        return pids
+
+    @staticmethod
+    def _alive(pid: str) -> bool:
+        return subprocess.run(["ps", "-p", pid], capture_output=True, stdin=subprocess.DEVNULL,
+                              check=False).returncode == 0
+
+    @pytest.mark.asyncio
+    async def test_an_existing_checkout_is_reused_as_it_stands_and_runs_no_git(self, harness, tmp_path):
+        workspace = tmp_path / "checkouts" / DISPATCH_ID
+        workspace.mkdir(parents=True)
+        _git("init", "--quiet", cwd=workspace)
+        marker = tmp_path / "ran-from-config"
+        # What a model could write into its checkout's config: a remote whose transport runs a command.
+        _git("config", "protocol.ext.allow", "always", cwd=workspace)
+        _git("remote", "add", "origin", f"ext::sh -c touch% {marker}", cwd=workspace)
+        (workspace / "uncommitted.txt").write_text("work in progress")
+        assert (await harness.post(_dispatch())).status == 202
+        assert len(harness.admitted) == 1
+        assert (workspace / "uncommitted.txt").read_text() == "work in progress"
+        assert not marker.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_folder_that_is_not_a_checkout_is_kept_when_preparation_fails(self, harness, tmp_path):
+        workspace = tmp_path / "checkouts" / DISPATCH_ID
+        workspace.mkdir(parents=True)
+        (workspace / "someone-elses.txt").write_text("keep me")
+        assert (await harness.post(_dispatch())).status == 202
+        await async_wait_until(lambda: harness.snugban.steps("fail"), timeout=10, what="the fail report")
+        await _reports_done(harness)
+        assert (workspace / "someone-elses.txt").read_text() == "keep me"
+        assert harness.admitted == []
+
+    @pytest.mark.asyncio
+    async def test_hooks_never_run_during_preparation(self, harness, tmp_path, monkeypatch):
+        marker = tmp_path / "hook-ran"
+        template = tmp_path / "template"
+        (template / "hooks").mkdir(parents=True)
+        hook = template / "hooks" / "post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+        hook.chmod(0o755)
+        global_config = tmp_path / "gitconfig"
+        global_config.write_text(f"[init]\n\ttemplateDir = {template}\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+        assert (await harness.post(_dispatch())).status == 202
+        assert len(harness.admitted) == 1
+        workspace = tmp_path / "checkouts" / DISPATCH_ID
+        assert (workspace / ".git" / "hooks" / "post-checkout").exists()  # the template was used
+        assert not marker.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_preparation_that_runs_too_long_is_killed_and_fails(self, harness, tmp_path, monkeypatch):
+        import gateway.platforms.webhook_snugban_checkout as checkout
+        monkeypatch.setattr(checkout, "PREPARE_TIMEOUT_SECONDS", 1.0)
+        pids = self._slow_remote(harness, tmp_path, monkeypatch, delay=60, child=True)
+        began = time.monotonic()
+        assert (await harness.post(_dispatch())).status == 202
+        assert time.monotonic() - began < 30
+        reason = json.loads(harness.snugban.steps("fail")[0]["body"])["reason"]
+        assert "timed out" in reason
+        assert harness.admitted == []
+        assert not (tmp_path / "checkouts" / DISPATCH_ID).exists()
+        assert not [p for p in (tmp_path / "checkouts").iterdir() if p.name.startswith(".cloning-")]
+        await async_wait_until(lambda: not any(self._alive(pid) for pid in pids.read_text().split()), timeout=10,
+                               what="git's transport and its child to be killed")
+
+    @pytest.mark.asyncio
+    async def test_an_abort_while_the_clone_runs_fails_nothing_and_starts_nothing(self, harness, tmp_path,
+                                                                                   monkeypatch):
+        self._slow_remote(harness, tmp_path, monkeypatch, delay=2)
+        body, headers = _signed(_dispatch())
+        assert (await harness.cli.post("/webhooks/snugban", data=body, headers=headers)).status == 202
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == [] and harness.admitted == []
+        assert not (tmp_path / "checkouts" / DISPATCH_ID).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_resend_while_the_clone_runs_starts_no_second_clone(self, harness, tmp_path, monkeypatch):
+        pids = self._slow_remote(harness, tmp_path, monkeypatch, delay=2)
+        body, headers = _signed(_dispatch())
+        assert (await harness.cli.post("/webhooks/snugban", data=body, headers=headers)).status == 202
+        resend = await harness.post(_dispatch())
+        assert resend.status == 200 and (await resend.json())["status"] == "duplicate"
+        await _reports_done(harness)
+        assert len(harness.snugban.steps("fail")) == 1 and harness.snugban.steps("ack") == []
+        assert len(pids.read_text().split()) == 1  # one transport: one clone
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_while_the_clone_runs_fails_only_the_new_dispatch(self, harness, tmp_path,
+                                                                                   monkeypatch):
+        self._slow_remote(harness, tmp_path, monkeypatch, delay=2)
+        body, headers = _signed(_dispatch())
+        assert (await harness.cli.post("/webhooks/snugban", data=body, headers=headers)).status == 202
+        revision = _dispatch("01REVISION0000000000000000", revision={"changes": "Fix it."})
+        assert (await harness.post(revision)).status == 202
+        await _reports_done(harness)
+        assert [r["id"] for r in harness.snugban.steps("fail")] == ["01REVISION0000000000000000"]
+
+    @pytest.mark.asyncio
+    async def test_leftover_scratch_folders_are_removed_when_the_route_connects(self, harness, tmp_path):
+        root = tmp_path / "checkouts"
+        for name in (f".removing-{DISPATCH_ID}-abcd1234", f".cloning-{DISPATCH_ID}-abcd1234"):
+            (root / name / "x").mkdir(parents=True)
+        (root / "01KEPTDISPATCH").mkdir()
+        assert await harness.adapter.connect()
+        try:
+            await async_wait_until(lambda: sorted(p.name for p in root.iterdir()) == ["01KEPTDISPATCH"],
+                                   timeout=10, what="the scratch folders to be removed")
+        finally:
+            await harness.adapter.disconnect()
+
+
 class TestWorkspace:
     """Each dispatch works in a checkout of its own, kept across pause and resume, removed when it ends."""
 
@@ -742,6 +903,8 @@ class TestWorkspace:
         workspace = Path(self._workspace(harness, harness.admitted[0]))
         await _end_run(harness, harness.admitted[0])
         await async_wait_until(lambda: not workspace.exists(), timeout=10, what="the checkout to be removed")
+        await async_wait_until(lambda: not list(workspace.parent.iterdir()), timeout=10,
+                               what="the checkout moved aside to be deleted")
 
     @pytest.mark.asyncio
     async def test_an_aborted_dispatch_keeps_its_directory_until_its_run_stops(self, harness):
@@ -812,10 +975,19 @@ class TestReplacingRuns:
         import gateway.platforms.webhook_snugban_receiver as receiver_module
         monkeypatch.setattr(receiver_module, "_SETTLE_WAIT_SECONDS", 0.2)
         assert (await harness.post(_dispatch())).status == 202
+        harness.run_agent(harness.admitted[0], FakeAgent())  # started: a stop must wait for it to end
         assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
-        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 503
+        resp = await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})
+        assert resp.status == 503 and "resume the dispatch again" in (await resp.json())["error"]
         assert len(harness.admitted) == 1
         await _end_run(harness, harness.admitted[0])
+        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
+
+    @pytest.mark.asyncio
+    async def test_pausing_a_run_still_queued_withdraws_it_so_resume_need_not_wait(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
+        assert _admission_status(harness, harness.admitted[0]) == "terminal"
         assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
 
     @pytest.mark.asyncio
@@ -880,6 +1052,38 @@ class TestRestartRebind:
             await harness.adapter.disconnect()
 
 
+class TestRebindSafety:
+    @pytest.mark.asyncio
+    async def test_a_rebind_that_breaks_does_not_stop_the_platform_connecting(self, harness, monkeypatch, caplog):
+        import gateway.platforms.webhook_snugban_receiver as receiver_module
+
+        def _broken(adapter):
+            raise RuntimeError("store unreadable")
+
+        monkeypatch.setattr(receiver_module, "rebind_workspaces", _broken)
+        assert await harness.adapter.connect()
+        try:
+            assert any("store unreadable" in str(r.exc_info) for r in caplog.records if r.levelname == "ERROR")
+        finally:
+            await harness.adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_the_bindings_of_a_runs_continuation_go_when_the_run_ends(self, harness):
+        from tools.terminal_tool import resolve_task_overrides
+        assert (await harness.post(_dispatch())).status == 202
+        db, first = harness.runner.session_authority.db, _session_id(harness, harness.admitted[0])
+        db.append_message(first, "user", "work it")
+        db.end_session(first, "compression")
+        db.create_session("continued-child", source="webhook", parent_session_id=first)
+        db.append_message("continued-child", "user", "carry on")
+        assert await harness.adapter.connect()  # binds the continuation too
+        await harness.adapter.disconnect()
+        assert resolve_task_overrides("continued-child").get("cwd")
+        await _end_run(harness, harness.admitted[0])
+        assert "cwd" not in resolve_task_overrides("continued-child")
+        assert "cwd" not in resolve_task_overrides(first)
+
+
 class TestRestart:
     """The receiver forgets everything on a gateway restart; durable admission does not."""
 
@@ -926,6 +1130,16 @@ class TestRestart:
         self._restart(harness)
         assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
         assert agent.interrupts
+
+    @pytest.mark.asyncio
+    async def test_an_abort_after_a_restart_cancels_a_queued_resumed_run(self, harness):
+        assert (await harness.post(_dispatch())).status == 202
+        assert (await harness.post({"type": "pause", "dispatchId": DISPATCH_ID})).status == 200
+        await _end_run(harness, harness.admitted[0])
+        assert (await harness.post({"type": "resume", "dispatchId": DISPATCH_ID})).status == 202
+        self._restart(harness)
+        assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
+        assert _admission_status(harness, harness.admitted[1]) == "terminal"
 
     @pytest.mark.asyncio
     async def test_an_abort_after_a_restart_stops_a_queued_resumed_session_when_it_starts(self, harness):
@@ -977,12 +1191,14 @@ class TestControl:
         assert len(harness.snugban.steps("heartbeat")) <= beats + 1
 
     @pytest.mark.asyncio
-    async def test_abort_before_the_run_starts_stops_it_when_it_starts(self, harness):
+    async def test_an_abort_cancels_a_run_still_queued_and_removes_its_checkout(self, harness, tmp_path):
         assert (await harness.post(_dispatch())).status == 202
         assert (await harness.post({"type": "abort", "dispatchId": DISPATCH_ID})).status == 200
-        agent = FakeAgent()
-        harness.run_agent(harness.admitted[0], agent)
-        await async_wait_until(lambda: agent.interrupts, timeout=10, what="the late run to be stopped")
+        assert _admission_status(harness, harness.admitted[0]) == "terminal"
+        await async_wait_until(lambda: not (tmp_path / "checkouts" / DISPATCH_ID).exists(), timeout=10,
+                               what="the aborted checkout to be removed")
+        await _reports_done(harness)
+        assert harness.snugban.steps("fail") == []
 
     @pytest.mark.asyncio
     async def test_an_abort_for_an_unknown_dispatch_blocks_a_late_dispatch(self, harness):

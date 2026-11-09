@@ -9,7 +9,6 @@ import json
 import logging
 import re
 import shutil
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -20,7 +19,7 @@ from gateway.platforms.webhook_snugban import (
     _MAX_REMEMBERED, _SIGNATURE_HEADER, ANSWERED_INTRO, RESUMED_INTRO, SnugbanClient, _decision_prompt,
     _decision_text, _dispatch_prompt, _Invalid, _json, _require_dispatch_shape, _valid_id, dispatch_of_delivery,
     dispatch_workspace, remote_url, snugban_block, webhook_delivery_of)
-from gateway.platforms.webhook_snugban_checkout import CheckoutError, git_env, prepare_checkout
+from gateway.platforms.webhook_snugban_checkout import CheckoutError, git_env, prepare_checkout, remove_scratch
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +72,27 @@ def _admitted(payload: dict) -> dict:
     return {key: value for key, value in payload.items() if key != "deliveryId"}
 
 
+def snugban_routes_connected(adapter) -> None:
+    """Startup work for the Snugban routes of a connecting webhook adapter: rebind runs to their checkouts,
+    and delete scratch folders a stopped process left. Neither may keep the platform from connecting."""
+    try:
+        if bound := rebind_workspaces(adapter):
+            logger.info("[webhook] Rebound %d Snugban dispatch run(s) to their checkouts", bound)
+    except Exception:
+        logger.exception("[webhook] Could not rebind Snugban dispatch runs to their checkouts")
+    for route_name, route_config in adapter._routes.items():
+        if isinstance(snugban_block(route_config), dict):
+            root = dispatch_workspace(route_config, route_name, "_").parent
+            task = asyncio.create_task(asyncio.to_thread(remove_scratch, root), name=f"snugban-scratch-{route_name}")
+            adapter._background_tasks.add(task)
+            task.add_done_callback(adapter._background_tasks.discard)
+
+
 def rebind_workspaces(adapter) -> int:
-    """Bind each Snugban dispatch run that is not over (queued, started, or interrupted by the last
-    shutdown) to its dispatch's checkout again: the binding lives in memory, and durable admission resumes
-    such runs after a restart before Snugban resends anything. Returns how many runs were bound."""
+    """Bind each Snugban dispatch run that is not over to its dispatch's checkout again: the binding lives in
+    memory, and durable admission resumes such runs after a restart before Snugban resends anything.
+    ``unknown`` admissions (a run the last shutdown cut off) are bound too: the gateway may resume them, and
+    a binding for a run that never resumes costs nothing. Returns how many runs were bound."""
     from gateway.session_authorities import all_authorities
     runner = adapter.gateway_runner or getattr(getattr(adapter, "_message_handler", None), "__self__", None)
     bound = 0
@@ -309,7 +325,9 @@ class SnugbanReceiver:
         it open. An outcome that is not known (the run crashed, its finalization failed) fails nothing."""
         if run.session_id:
             from tools.terminal_tool import clear_task_env_overrides
-            clear_task_env_overrides(run.session_id)
+            for task_id in {run.session_id, run.db.resolve_resume_session_id(run.session_id) if run.db else None}:
+                if task_id:
+                    clear_task_env_overrides(task_id)
         if dispatch.run is not run:
             return
         if run.stopped or dispatch.state != "running":
@@ -352,6 +370,31 @@ class SnugbanReceiver:
         run.stopped = True
         await self._stop_delivery(run.delivery_id, reason, until=run.ended, limit=_STOP_ENFORCE_LIMIT_SECONDS)
 
+    async def _cancel_if_queued(self, delivery_id: str) -> bool:
+        """Withdraw the delivery's admission if its run has not started: it then never runs. False when there
+        is none, or the drain claimed it first (the caller stops the started run)."""
+        from gateway.session_authorities import all_authorities
+        from gateway.session_contract import SessionActor, SessionRef
+        from hermes_state_runtime import RuntimeStoreError
+        for authority in all_authorities(self._runner()):
+            rows = authority.db._read_all(
+                "SELECT admission_id, principal_id, target_session_id FROM session_admissions "
+                "WHERE request_id=? AND status='queued'", (delivery_id,))
+            for row in rows:
+                # The admission's own principal, as the gateway withdraws its other queued producer inputs.
+                actor = SessionActor(row["principal_id"], authority.profile_id,
+                                     frozenset({"session:submit", "session:control", "session:operator"}),
+                                     "snugban-withdraw")
+                try:
+                    receipt = await authority.cancel_queued(
+                        actor, SessionRef(authority.profile_id, row["target_session_id"]), row["admission_id"])
+                except RuntimeStoreError:
+                    return False
+                if receipt.outcome == "cancelled":
+                    logger.info("[webhook] Withdrew the queued Snugban run %s", delivery_id)
+                    return True
+        return False
+
     def _session_id_of(self, delivery_id: str) -> Optional[str]:
         """The session the delivery was admitted to (its admission's request id is the delivery id)."""
         from gateway.session_authorities import active_authority
@@ -381,6 +424,7 @@ class SnugbanReceiver:
                 if killed:
                     logger.info("[webhook] Killed %d process(es) of Snugban run %s", killed, delivery_id)
 
+        await self._cancel_if_queued(delivery_id)
         await _interrupt()
 
         async def _enforce() -> None:
@@ -479,24 +523,22 @@ class SnugbanReceiver:
 
     async def _take(self, dispatch: _Dispatch) -> None:
         """Check the dispatch out into its own folder, then admit its run and acknowledge it. A checkout that
-        cannot be made fails the dispatch; an admission that fails leaves it unacknowledged, so Snugban's
-        resend is taken again."""
+        cannot be made fails the dispatch, unless it was aborted or replaced meanwhile; an admission that fails
+        leaves it unacknowledged, so Snugban's resend is taken again."""
         payload, workspace = dispatch.payload, self._workspace(dispatch.id)
-        repo = (payload["project"].get("repo") or {}).get("githubRepo")
         try:
-            if not repo:
-                raise CheckoutError("the project has no GitHub repository to check out")
-            with self._adapter._profile_scope(self._profile):
-                from tools.environments.local import served_profile_child_env
-                env = git_env(served_profile_child_env())
-            await asyncio.to_thread(prepare_checkout, workspace, remote_url(self._route_config(), repo), repo,
-                                    payload["branch"], payload["project"].get("defaultBranch"), env)
-        except (CheckoutError, OSError, subprocess.TimeoutExpired) as exc:
-            reason = str(exc) if isinstance(exc, CheckoutError) else f"{type(exc).__name__} preparing the folder"
-            logger.warning("[webhook] Snugban dispatch %s: no checkout: %s", dispatch.id, reason)
-            self._finish(dispatch, "ended")
-            self._remove_workspace(dispatch.id)
-            self._report(dispatch.id, "fail", {"reason": f"Hermes could not prepare the checkout: {reason}"})
+            await self._prepare(dispatch, workspace)
+        except Exception as exc:
+            if isinstance(exc, CheckoutError):
+                reason = str(exc)
+                logger.warning("[webhook] Snugban dispatch %s: no checkout: %s", dispatch.id, reason)
+            else:
+                reason = f"{type(exc).__name__} while preparing it"
+                logger.exception("[webhook] Snugban dispatch %s: preparing its checkout failed", dispatch.id)
+            # Whatever the folder holds, this attempt did not make it (a failed clone leaves no trace): keep it.
+            if dispatch.state == "preparing":
+                self._finish(dispatch, "ended")
+                self._report(dispatch.id, "fail", {"reason": f"Hermes could not prepare the checkout: {reason}"})
             return
         if dispatch.state != "preparing":  # aborted or replaced while it was being checked out
             self._finish(dispatch, dispatch.state)
@@ -515,6 +557,20 @@ class SnugbanReceiver:
         self._report(dispatch.id, "ack")
         logger.info("[webhook] Snugban dispatch %s %s on route %s", dispatch.id,
                     "adopted from before a restart" if outcome == "duplicate" else "accepted", self._route_name)
+
+    async def _prepare(self, dispatch: _Dispatch, workspace) -> None:
+        repo = (dispatch.payload["project"].get("repo") or {}).get("githubRepo")
+        if not repo:
+            raise CheckoutError("the project has no GitHub repository to check out")
+        with self._adapter._profile_scope(self._profile):
+            from tools.environments.local import served_profile_child_env
+            env = git_env(served_profile_child_env())
+        from gateway.platforms import webhook_snugban_checkout as checkout
+        made = await asyncio.to_thread(
+            prepare_checkout, workspace, remote_url(self._route_config(), repo), repo, dispatch.payload["branch"],
+            dispatch.payload["project"].get("defaultBranch"), env, checkout.PREPARE_TIMEOUT_SECONDS)
+        if not made:
+            logger.info("[webhook] Snugban dispatch %s: reusing its existing checkout as it stands", dispatch.id)
 
     async def _replace_runs_of_task(self, task_id: Any) -> bool:
         """A new dispatch of a task replaces any earlier one held here (Snugban sends work back as a new
@@ -576,7 +632,7 @@ class SnugbanReceiver:
         if dispatch is None or dispatch.state != "paused" or dispatch.payload is None:
             return _json({"error": f"Dispatch {dispatch_id} is not paused here"}, 404)
         if not await self._runs_ended([dispatch.run] if dispatch.run is not None else []):
-            return _json({"error": "The paused run is still stopping; retry this delivery"}, 503)
+            return _json({"error": "The paused run is still stopping; resume the dispatch again"}, 503)
         outcome = await self._run_again(dispatch, RESUMED_INTRO, f"snugban:resume:{dispatch_id}:{delivery_id}")
         if outcome != "accepted":
             return _json({"error": "Admission unavailable; retry this delivery"}, 503)

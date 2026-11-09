@@ -78,11 +78,24 @@ def snugban_route_problem(route_config: dict, secret: Any) -> Optional[str]:
     if root is not None and (not _is_set(root) or not Path(root).expanduser().is_absolute()):
         return "snugban.workspace_root must be an absolute directory (each dispatch gets a checkout under it)"
     remote_base = block.get("git_remote_base")
-    if remote_base is not None and (not _is_set(remote_base) or any(c.isspace() for c in remote_base)):
-        return "snugban.git_remote_base must be a URL prefix such as https://github.com/ or git@github.com:"
+    if remote_base is not None and (problem := _remote_base_problem(remote_base)):
+        return problem
     if not _is_set(block.get("agent_key")):
         return ("snugban.agent_key is missing, blank or an unset ${...} reference; set it to the agent key "
                 "Snugban issued (e.g. agent_key: \"${SNUGBAN_AGENT_KEY}\" with the variable in .env)")
+    return None
+
+
+def _remote_base_problem(base: Any) -> Optional[str]:
+    """Why *base* cannot prefix ``owner/name.git``: it must end in ``/`` or ``:`` and carry no credentials
+    (an HTTP(S) user or token, any password); credentials come from a git credential helper or SSH keys."""
+    usage = "snugban.git_remote_base must be a URL prefix such as https://github.com/ or git@github.com:"
+    if not _is_set(base) or any(c.isspace() for c in base) or not base.endswith(("/", ":")):
+        return usage
+    parsed = urlparse(base) if "://" in base else None
+    if parsed is not None and (parsed.password or (parsed.username and parsed.scheme in ("http", "https"))):
+        return ("snugban.git_remote_base must not hold credentials; use a git credential helper "
+                "(gh auth setup-git) or SSH keys")
     return None
 
 
